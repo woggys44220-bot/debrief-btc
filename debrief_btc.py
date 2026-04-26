@@ -974,13 +974,7 @@ def associate_trade_context(
 
             confidence = assoc["confidence"]
             entry_context_usable = assoc.get("entry_context_usable", False)
-            comment = "contexte valide"
-            if not selected or confidence == "faible" or not entry_context_usable:
-                comment = "Contexte snapshot non exploitable — analyse graphique nécessaire."
-            elif any("M5_TOO_FAR" in str(e.get("event", "")) for e in near_console):
-                comment = "entrée tardive possible"
-            elif any("OUT_OF_SESSION" in str(e.get("event", "")) for e in near_console):
-                comment = "marché sale possible"
+            comment = "Contexte non exploitable — analyse graphique nécessaire"
 
             items.append(
                 {
@@ -1100,60 +1094,31 @@ def snapshot_summary_line(snapshot: Optional[Dict[str, Any]], anchor: Optional[d
     )
 
 
-def is_matching_reliable(trade: Trade, snapshot: Optional[Dict[str, Any]], diagnostic: Dict[str, Any]) -> Tuple[bool, str]:
+def is_matching_reliable(trade: Trade, snapshot: Optional[Dict[str, Any]], diagnostic: Dict[str, Any]) -> Tuple[str, str]:
     if not snapshot:
-        return False, "Aucun snapshot retenu."
+        return "NON", "Aucun snapshot retenu."
     reasons = []
-    reliable = True
     trade_side = normalize_side(trade.side)
     snap_side = snapshot_side(snapshot)
-    if trade_side in {"BUY", "SELL"} and snap_side == trade_side:
-        reasons.append("même side")
-    else:
-        reasons.append("side différent ou absent")
-        reliable = False
+    same_side = trade_side in {"BUY", "SELL"} and snap_side == trade_side
 
     trade_entry = trade.entry_price
     snap_entry = snapshot_price(snapshot, ("entry", "entry_price", "price", "open_price"))
-    if price_delta_ok(trade_entry, snap_entry):
-        reasons.append("même entry (tolérance)")
-    else:
-        reasons.append("entry non proche")
-        reliable = False
-
-    id_match = False
-    for family, trade_value in {"ticket": trade.ticket, "order": trade.order, "deal": trade.deal}.items():
-        if trade_value and snapshot_identifier(snapshot, family) == str(trade_value):
-            id_match = True
-            break
-    reasons.append("même order/ticket/deal" if id_match else "order/ticket/deal non confirmés")
-    if not id_match:
-        reliable = False
+    delta_entry = abs(trade_entry - snap_entry) if trade_entry is not None and snap_entry is not None else None
 
     gap = diagnostic.get("gap_minutes")
     reasons.append(f"écart après offset={gap:.2f} min" if gap is not None else "écart après offset=N/A")
-    if gap is None or gap > WEAK_CONFIDENCE_GAP_MINUTES:
-        reliable = False
-    return reliable, ", ".join(reasons)
+    reasons.append("side identique" if same_side else "side différent/absent")
+    reasons.append(f"delta_entry={delta_entry:.2f}" if delta_entry is not None else "delta_entry=N/A")
 
-
-def should_generate_auto_comment(
-    ctx: Dict[str, Any], trade: Trade, snapshot: Optional[Dict[str, Any]], diagnostic: Dict[str, Any]
-) -> bool:
-    if not ctx.get("entry_context_usable") or not snapshot:
-        return False
-    if normalize_side(trade.side) not in {"BUY", "SELL"}:
-        return False
-    if trade.entry_price is None:
-        return False
-    has_gpt_decision = snapshot_value(snapshot, ("gpt_decision", "decision_gpt", "decision", "gpt")) != "N/A"
-    has_id_match = any(
-        trade_value and snapshot_identifier(snapshot, family) == str(trade_value)
-        for family, trade_value in {"ticket": trade.ticket, "order": trade.order, "deal": trade.deal}.items()
-    )
-    gap = diagnostic.get("gap_minutes")
-    has_close_snapshot = gap is not None and gap <= 2.0
-    return has_gpt_decision or has_id_match or has_close_snapshot
+    if gap is not None and gap > WEAK_CONFIDENCE_GAP_MINUTES:
+        return "NON", ", ".join(reasons + ["écart > 15 min"])
+    if gap is not None and gap <= 2.0 and same_side and delta_entry is not None:
+        if delta_entry <= 5:
+            return "OUI", ", ".join(reasons + ["règle <=2min + side + delta_entry<=5"])
+        if delta_entry <= 15:
+            return "MOYEN", ", ".join(reasons + ["règle <=2min + side + delta_entry<=15"])
+    return "NON", ", ".join(reasons + ["conditions de matching fiable non atteintes"])
 
 
 def build_html(
@@ -1206,17 +1171,19 @@ def build_html(
 
         before_line = snapshot_summary_line(best_before, trade_anchor, "Meilleur snapshot AVANT entrée")
         after_line = snapshot_summary_line(best_after, trade_anchor, "Meilleur snapshot APRÈS entrée")
-        reliable, reliable_reason = is_matching_reliable(t, selected_snapshot, snap_debug)
+        reliable_status, reliable_reason = is_matching_reliable(t, selected_snapshot, snap_debug)
+        context_exploitable = reliable_status in {"OUI", "MOYEN"}
         real_gap = snap_debug.get("gap_minutes")
         gpt_decision = (
             snapshot_value(selected_snapshot, ("gpt_decision", "decision_gpt", "decision", "gpt"))
             if selected_snapshot
             else "N/A"
         )
-        if should_generate_auto_comment(ctx, t, selected_snapshot, snap_debug):
-            auto_comment = ctx["comment"]
-        else:
-            auto_comment = "Commentaire qualité non généré: données insuffisantes (snapshot/side/entry/décision)."
+        auto_comment = (
+            "Snapshot exploitable — analyse graphique recommandée"
+            if context_exploitable
+            else "Contexte non exploitable — analyse graphique nécessaire"
+        )
 
         diag_line = ""
         gap = snap_debug.get("gap_minutes")
@@ -1262,8 +1229,8 @@ def build_html(
             f"<p><b>{before_line}</b></p>"
             f"<p><b>{after_line}</b></p>"
             f"<p><b>Snapshot retenu pour contexte d'entrée:</b> {fmt_dt(selected_snapshot.get('_timestamp')) if selected_snapshot else 'Aucun'} | "
-            f"<b>Contexte exploitable:</b> {'oui' if ctx.get('entry_context_usable') else 'non'}</p>"
-            f"<p><b>Matching fiable:</b> {'OUI' if reliable else 'NON'} | <b>Raison:</b> {html.escape(reliable_reason)} | "
+            f"<b>Contexte exploitable:</b> {'contexte snapshot exploitable' if context_exploitable else 'contexte non exploitable'}</p>"
+            f"<p><b>Matching fiable:</b> {reliable_status} | <b>Raison:</b> {html.escape(reliable_reason)} | "
             f"<b>Décision GPT snapshot:</b> {html.escape(gpt_decision)}</p>"
             f"<p><b>Charts liées:</b> {images}</p>"
             f"<p><b>Commentaire automatique:</b> {html.escape(auto_comment)}</p>"
@@ -1395,6 +1362,13 @@ th,td {{ border: 1px solid #ccc; padding: 6px; font-size: 13px; text-align: left
 <li>Qu’est-ce qu’il ne faut surtout pas modifier ?</li>
 <li>Une modification du bot est-elle vraiment justifiée après cette journée ?</li>
 </ol>
+<h2>10) Ce que le rapport peut conclure / ne peut pas conclure</h2>
+<ul>
+<li><b>Peut conclure:</b> qualité du matching temporel (avec offset), cohérence side/entry avec snapshot, et niveau de fiabilité (OUI/MOYEN/NON).</li>
+<li><b>Peut conclure:</b> si le snapshot est exploitable pour orienter la revue (analyse graphique recommandée).</li>
+<li><b>Ne peut pas conclure:</b> une qualification du marché (ex: "marché sale") sans données M5/M15 détaillées ou validation visuelle graphique.</li>
+<li><b>Ne peut pas conclure:</b> la cause exacte d'un SL/TP sans analyse graphique complémentaire.</li>
+</ul>
 </body></html>"""
     return html_content
 
