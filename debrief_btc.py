@@ -59,6 +59,10 @@ MATCH_WINDOWS_MINUTES = {
     "exit_around": 5,
 }
 
+ENTRY_CONTEXT_BEFORE_MINUTES = 15
+ENTRY_CONTEXT_AFTER_MINUTES = 2
+WEAK_CONFIDENCE_GAP_MINUTES = 15
+
 SNAPSHOT_ASSOCIATION_OFFSETS_HOURS = [0, 2, -2, 3, -3, 4, -4]
 WIDE_PRE_ENTRY_WINDOW_MINUTES = 120
 
@@ -742,7 +746,34 @@ def select_by_time(candidates: List[Dict[str, Any]], anchor: datetime) -> Option
     return min(candidates, key=lambda s: abs((s.get("_timestamp") - anchor).total_seconds()) if s.get("_timestamp") else 1e18)
 
 
+def gap_minutes(anchor: datetime, snapshot: Optional[Dict[str, Any]]) -> Optional[float]:
+    if not snapshot or not snapshot.get("_timestamp"):
+        return None
+    return abs((snapshot["_timestamp"] - anchor).total_seconds()) / 60.0
+
+
+def best_snapshot_before(anchor: datetime, snapshots: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    candidates = [s for s in snapshots if s.get("_timestamp") and s["_timestamp"] <= anchor]
+    return max(candidates, key=lambda s: s["_timestamp"]) if candidates else None
+
+
+def best_snapshot_after(anchor: datetime, snapshots: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    candidates = [s for s in snapshots if s.get("_timestamp") and s["_timestamp"] > anchor]
+    return min(candidates, key=lambda s: s["_timestamp"]) if candidates else None
+
+
+def is_entry_context_window(anchor: datetime, snapshot: Optional[Dict[str, Any]]) -> bool:
+    if not snapshot or not snapshot.get("_timestamp"):
+        return False
+    ts = snapshot["_timestamp"]
+    lower_bound = anchor - timedelta(minutes=ENTRY_CONTEXT_BEFORE_MINUTES)
+    upper_bound = anchor + timedelta(minutes=ENTRY_CONTEXT_AFTER_MINUTES)
+    return lower_bound <= ts <= upper_bound
+
+
 def match_trade_snapshot(trade: Trade, snapshots: List[Dict[str, Any]], anchor: datetime) -> Dict[str, Any]:
+    before_snapshot = best_snapshot_before(anchor, snapshots)
+    after_snapshot = best_snapshot_after(anchor, snapshots)
     closest_snapshot = select_by_time([s for s in snapshots if s.get("_timestamp")], anchor)
     closest_time = closest_snapshot.get("_timestamp") if closest_snapshot else None
     closest_gap_min = abs((closest_time - anchor).total_seconds()) / 60.0 if closest_time else None
@@ -752,9 +783,11 @@ def match_trade_snapshot(trade: Trade, snapshots: List[Dict[str, Any]], anchor: 
     trade_ids = {"ticket": trade.ticket, "order": trade.order, "deal": trade.deal}
     ids_available = any(trade_ids.values())
 
+    windowed_snapshots = [s for s in snapshots if is_entry_context_window(anchor, s)]
+
     id_candidates = []
     if ids_available:
-        for snap in snapshots:
+        for snap in windowed_snapshots:
             if not snap.get("_timestamp"):
                 continue
             for family, value in trade_ids.items():
@@ -767,14 +800,14 @@ def match_trade_snapshot(trade: Trade, snapshots: List[Dict[str, Any]], anchor: 
     confidence = "haute"
 
     if not selected:
-        order_ok_candidates = [s for s in snapshots if s.get("_timestamp") and snapshot_is_order_ok(s)]
+        order_ok_candidates = [s for s in windowed_snapshots if s.get("_timestamp") and snapshot_is_order_ok(s)]
         selected = select_by_time(order_ok_candidates, anchor)
         method = "B:ORDER_OK plus proche"
         confidence = "moyenne"
 
     if not selected:
         c_candidates = []
-        for snap in snapshots:
+        for snap in windowed_snapshots:
             if not snap.get("_timestamp"):
                 continue
             if snapshot_side(snap) != trade_side:
@@ -787,7 +820,7 @@ def match_trade_snapshot(trade: Trade, snapshots: List[Dict[str, Any]], anchor: 
 
     if not selected and trade.open_time:
         setup_candidates = []
-        for snap in snapshots:
+        for snap in windowed_snapshots:
             ts = snap.get("_timestamp")
             if not ts or ts > anchor:
                 continue
@@ -813,6 +846,9 @@ def match_trade_snapshot(trade: Trade, snapshots: List[Dict[str, Any]], anchor: 
             "selected": None,
             "method": "aucune",
             "confidence": "faible",
+            "entry_context_usable": False,
+            "before_snapshot": before_snapshot,
+            "after_snapshot": after_snapshot,
             "diagnostic": {
                 "trade_time": anchor,
                 "closest_snapshot_time": closest_time,
@@ -829,14 +865,25 @@ def match_trade_snapshot(trade: Trade, snapshots: List[Dict[str, Any]], anchor: 
 
     selected_time = selected.get("_timestamp")
     selected_entry = snapshot_price(selected, ("entry", "entry_price", "price", "open_price"))
+    selected_gap = abs((selected_time - anchor).total_seconds()) / 60.0 if selected_time else None
+    entry_context_usable = is_entry_context_window(anchor, selected)
+    real_confidence = confidence
+    if selected_gap is not None and selected_gap > WEAK_CONFIDENCE_GAP_MINUTES:
+        real_confidence = "faible"
+    if real_confidence == "haute" and (selected_gap is None or selected_gap > WEAK_CONFIDENCE_GAP_MINUTES):
+        real_confidence = "moyenne"
+
     return {
         "selected": selected,
         "method": method,
-        "confidence": confidence,
+        "confidence": real_confidence,
+        "entry_context_usable": entry_context_usable,
+        "before_snapshot": before_snapshot,
+        "after_snapshot": after_snapshot,
         "diagnostic": {
             "trade_time": anchor,
             "closest_snapshot_time": closest_time,
-            "gap_minutes": abs((selected_time - anchor).total_seconds()) / 60.0 if selected_time else None,
+            "gap_minutes": selected_gap,
             "entry_price_diff": abs(trade.entry_price - selected_entry) if trade.entry_price is not None and selected_entry is not None else None,
             "trade_ticket": trade.ticket,
             "trade_order": trade.order,
@@ -872,6 +919,9 @@ def associate_trade_context(
                         "snapshot_debug": {"reason": "trade_sans_horodatage"},
                         "association_method": "aucune",
                         "association_confidence": "faible",
+                        "entry_context_usable": False,
+                        "best_snapshot_before": None,
+                        "best_snapshot_after": None,
                     }
                 )
                 continue
@@ -882,9 +932,11 @@ def associate_trade_context(
             near_console = [e for e in console_events if e.get("timestamp") and abs(e["timestamp"] - shifted_anchor) <= timedelta(minutes=20)]
             near_charts = [c for c in chart_items if c.timestamp and abs(c.timestamp - shifted_anchor) <= timedelta(minutes=20)]
 
-            comment = "entrée propre"
-            if not selected:
-                comment = "association snapshots échouée (voir diagnostic horaire)"
+            confidence = assoc["confidence"]
+            entry_context_usable = assoc.get("entry_context_usable", False)
+            comment = "contexte valide"
+            if not selected or confidence == "faible" or not entry_context_usable:
+                comment = "Contexte snapshot non exploitable — analyse graphique nécessaire."
             elif any("M5_TOO_FAR" in str(e.get("event", "")) for e in near_console):
                 comment = "entrée tardive possible"
             elif any("OUT_OF_SESSION" in str(e.get("event", "")) for e in near_console):
@@ -899,7 +951,10 @@ def associate_trade_context(
                     "comment": comment,
                     "snapshot_debug": assoc["diagnostic"],
                     "association_method": assoc["method"],
-                    "association_confidence": assoc["confidence"],
+                    "association_confidence": confidence,
+                    "entry_context_usable": entry_context_usable,
+                    "best_snapshot_before": assoc.get("before_snapshot"),
+                    "best_snapshot_after": assoc.get("after_snapshot"),
                 }
             )
         return items
@@ -909,7 +964,7 @@ def associate_trade_context(
     best_score = (-1, -1, -1, -999)
     for offset in SNAPSHOT_ASSOCIATION_OFFSETS_HOURS:
         contexts = build_with_offset(offset)
-        matched = sum(1 for c in contexts if c["snapshots"])
+        matched = sum(1 for c in contexts if c.get("entry_context_usable"))
         high = sum(1 for c in contexts if c["association_confidence"] == "haute")
         medium = sum(1 for c in contexts if c["association_confidence"] == "moyenne")
         score = (matched, high, medium, -abs(offset))
@@ -922,6 +977,7 @@ def associate_trade_context(
         "tested_offsets_hours": SNAPSHOT_ASSOCIATION_OFFSETS_HOURS,
         "best_offset_hours": best_offset,
         "matched_trades": best_score[0],
+        "weak_trades": sum(1 for c in best_contexts if c.get("association_confidence") == "faible"),
     }
 
 
@@ -985,6 +1041,21 @@ def fmt_dt(dt: Optional[datetime]) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else "N/A"
 
 
+def snapshot_summary_line(snapshot: Optional[Dict[str, Any]], anchor: Optional[datetime], label: str) -> str:
+    if not snapshot:
+        return f"{label}: aucun"
+    ts = snapshot.get("_timestamp")
+    gap = abs((ts - anchor).total_seconds()) / 60.0 if (ts and anchor) else None
+    entry_val = snapshot_price(snapshot, ("entry", "entry_price", "price", "open_price"))
+    return (
+        f"{label}: {fmt_dt(ts)}"
+        f" | écart={f'{gap:.2f} min' if gap is not None else 'N/A'}"
+        f" | side={html.escape(snapshot_side(snapshot))}"
+        f" | entry={entry_val if entry_val is not None else 'N/A'}"
+        f" | décision GPT={html.escape(snapshot_value(snapshot, ('gpt_decision', 'decision_gpt', 'decision', 'gpt')))}"
+    )
+
+
 def build_html(
     base_dir: Path,
     out_dir: Path,
@@ -1019,24 +1090,18 @@ def build_html(
     context_blocks = []
     for ctx in contexts:
         t: Trade = ctx["trade"]
+        trade_anchor = t.open_time or t.close_time
         snap_debug = ctx.get("snapshot_debug", {})
-        closest_before = ctx["snapshots"][0] if ctx["snapshots"] else None
+        selected_snapshot = ctx["snapshots"][0] if ctx["snapshots"] else None
+        best_before = ctx.get("best_snapshot_before")
+        best_after = ctx.get("best_snapshot_after")
         images = " ".join(
             f'<a href="../{html.escape(rel(c.path))}">{html.escape(c.path.name)}</a>' for c in ctx["charts"]
         ) or "Aucune"
         evs = ", ".join(sorted({e["event"] for e in ctx["console_events"]})) or "Aucun"
-        closest_before_line = "Aucun snapshot trouvé avant entrée"
-        if closest_before:
-            closest_before_line = (
-                f"{fmt_dt(closest_before.get('_timestamp'))}"
-                f" | décision GPT={html.escape(snapshot_value(closest_before, ('gpt_decision', 'decision_gpt', 'decision', 'gpt')))}"
-                f" | side={html.escape(snapshot_side(closest_before))}"
-                f" | entry/sl/tp={html.escape(snapshot_value(closest_before, ('entry', 'entry_price')))} /"
-                f"{html.escape(snapshot_value(closest_before, ('sl', 'stop_loss')))} /"
-                f"{html.escape(snapshot_value(closest_before, ('tp', 'take_profit')))}"
-                f" | sniper={html.escape(snapshot_value(closest_before, ('sniper_filters', 'filters', 'entry_filter_skip_reason')))}"
-                f" | M15={html.escape(snapshot_value(closest_before, ('m15_context', 'context_m15', 'm15')))}"
-            )
+
+        before_line = snapshot_summary_line(best_before, trade_anchor, "Meilleur snapshot AVANT entrée")
+        after_line = snapshot_summary_line(best_after, trade_anchor, "Meilleur snapshot APRÈS entrée")
 
         diag_line = ""
         gap = snap_debug.get("gap_minutes")
@@ -1060,7 +1125,10 @@ def build_html(
             f"<p><b>Snapshots associés:</b> {len(ctx['snapshots'])} | <b>Événements console:</b> {html.escape(evs)}</p>"
             f"<p><b>Méthode d'association:</b> {html.escape(ctx.get('association_method', 'N/A'))} | "
             f"<b>Confiance:</b> {html.escape(ctx.get('association_confidence', 'faible'))}</p>"
-            f"<p><b>Snapshot avant entrée (plus proche):</b> {closest_before_line}</p>"
+            f"<p><b>{before_line}</b></p>"
+            f"<p><b>{after_line}</b></p>"
+            f"<p><b>Snapshot retenu pour contexte d'entrée:</b> {fmt_dt(selected_snapshot.get('_timestamp')) if selected_snapshot else 'Aucun'} | "
+            f"<b>Contexte exploitable:</b> {'oui' if ctx.get('entry_context_usable') else 'non'}</p>"
             f"<p><b>Charts liées:</b> {images}</p>"
             f"<p><b>Commentaire automatique:</b> {html.escape(ctx['comment'])}</p>"
             f"{diag_line}"
@@ -1144,7 +1212,8 @@ th,td {{ border: 1px solid #ccc; padding: 6px; font-size: 13px; text-align: left
 <ul>
 <li>Normalisation temporelle: parsing ISO + conversion UTC si offset présent (sinon heure serveur conservée)</li>
 <li>Offsets testés (trade MT5): {association_meta.get('tested_offsets_hours', [])} | offset retenu: {association_meta.get('best_offset_hours', 0)}h</li>
-<li>Trades associés via offset retenu: {association_meta.get('matched_trades', 0)}/{metrics.get('total_trades', 0)}</li>
+<li>Trades avec contexte snapshot exploitable (fenêtre -15/+2 min): {association_meta.get('matched_trades', 0)}/{metrics.get('total_trades', 0)}</li>
+<li>Associations faibles: {association_meta.get('weak_trades', 0)}</li>
 <li>Nombre de snapshots valides: {len(snaps.get('records', []))}</li>
 <li>Lignes invalides: {len(snaps.get('invalid_lines', []))}</li>
 <li>Champs disponibles: {', '.join(sorted(k for k in snaps.get('fields', {}).keys() if not k.startswith('_'))) or 'N/A'}</li>
@@ -1208,7 +1277,7 @@ def build_resume(
         f"Console: GPT_TIMEOUT={counts.get('GPT_TIMEOUT', 0)}, M5_TOO_FAR={counts.get('M5_TOO_FAR', 0)}, OUT_OF_SESSION={counts.get('OUT_OF_SESSION', 0)}, ALLOW={counts.get('ALLOW', 0)}, BLOCK={counts.get('BLOCK', 0)}",
         f"Contrôle rapport MT5: Nb trades={report_stats.get('nb_trades', 'N/A')}, Profit Total Net={report_stats.get('profit_total_net', 'N/A')} (sans remplacer le parsing Positions)",
         f"Snapshots: valides={len(snaps.get('records', []))}, invalides={len(snaps.get('invalid_lines', []))}, spread_moyen={snaps.get('spread_avg')}, distance_m5_moyenne={snaps.get('m5_distance_avg')}",
-        f"Association snapshots: offsets_testes={association_meta.get('tested_offsets_hours', [])}, offset_retenu={association_meta.get('best_offset_hours', 0)}h, trades_associes={association_meta.get('matched_trades', 0)}/{m.get('total_trades', 0)}",
+        f"Association snapshots: offsets_testes={association_meta.get('tested_offsets_hours', [])}, offset_retenu={association_meta.get('best_offset_hours', 0)}h, trades_contexte_exploitable={association_meta.get('matched_trades', 0)}/{m.get('total_trades', 0)}, associations_faibles={association_meta.get('weak_trades', 0)}",
         "Skips importants (console): "
         + ", ".join(
             f"{k}={counts.get(k, 0)}"
