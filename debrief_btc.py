@@ -120,6 +120,27 @@ def safe_float(value: Any) -> Optional[float]:
         return None
 
 
+def parse_fr_number(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    # Gère des formats MT5 type "76 247,00" et négatifs "- 15,45".
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"^\-\s+", "-", text)
+    text = text.replace(" ", "")
+    text = text.replace(",", ".")
+    # Nettoyage conservateur: garde uniquement chiffre, signe, point.
+    text = re.sub(r"[^0-9\.\-+]", "", text)
+    if text in {"", "-", "+", ".", "-.", "+."}:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
 def normalize_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", name.lower())
 
@@ -249,6 +270,152 @@ def parse_mt5(path: Path) -> Dict[str, Any]:
     if not path.exists():
         return {"warning": f"Fichier manquant: {path.name}", "trades": [], "headers": []}
 
+    text, warning = read_text_file(path)
+    if warning:
+        return {"warning": warning, "trades": [], "headers": []}
+
+    if is_mt5_tabulated_report(text):
+        return parse_mt5_tabulated_report(text)
+    return parse_mt5_simple_csv(path)
+
+
+def is_mt5_tabulated_report(text: str) -> bool:
+    lower = text.lower()
+    markers = [
+        "rapport d'historique de trading",
+        "positions",
+        "ordres",
+        "transactions",
+        "résultats",
+        "resultats",
+    ]
+    tabs_count = text.count("\t")
+    return tabs_count > 20 and sum(1 for m in markers if m in lower) >= 2
+
+
+def parse_mt5_tabulated_report(text: str) -> Dict[str, Any]:
+    lines = text.splitlines()
+    headers: List[str] = []
+    trades: List[Trade] = []
+    ignored_rows = 0
+    non_empty_rows = 0
+    report_stats: Dict[str, float] = {}
+
+    start_idx = next((i for i, line in enumerate(lines) if line.strip().lower() == "positions"), None)
+    if start_idx is None:
+        return {"warning": "Section Positions introuvable dans le rapport MT5", "trades": [], "headers": []}
+
+    end_markers = {"ordres", "orders"}
+    end_idx = len(lines)
+    for i in range(start_idx + 1, len(lines)):
+        if lines[i].strip().lower() in end_markers:
+            end_idx = i
+            break
+
+    section = lines[start_idx + 1 : end_idx]
+    if not section:
+        return {"warning": "Section Positions vide", "trades": [], "headers": []}
+
+    for raw in section:
+        if not raw.strip():
+            ignored_rows += 1
+            continue
+        cols = [c.strip() for c in raw.split("\t")]
+        cols = [c for c in cols if c != ""]
+        if not cols:
+            ignored_rows += 1
+            continue
+
+        # Ligne d'en-tête de la section Positions.
+        if normalize_name(cols[0]) == "heure" and len(cols) >= 10:
+            headers = cols
+            continue
+
+        non_empty_rows += 1
+        if len(cols) < 13:
+            ignored_rows += 1
+            continue
+
+        open_time = parse_datetime(cols[0])
+        symbol = cols[2]
+        side_raw = cols[3].strip().upper()
+        side = "BUY" if "BUY" in side_raw else "SELL" if "SELL" in side_raw else side_raw
+        entry_price = parse_fr_number(cols[5])
+        close_time = parse_datetime(cols[8])
+        exit_price = parse_fr_number(cols[9])
+        commission = parse_fr_number(cols[10])
+        swap = parse_fr_number(cols[11])
+        profit = parse_fr_number(cols[12])
+
+        has_core_data = any(
+            (
+                open_time is not None or close_time is not None,
+                bool(symbol),
+                bool(side),
+                entry_price is not None,
+                profit is not None,
+            )
+        )
+        if not has_core_data:
+            ignored_rows += 1
+            continue
+
+        trades.append(
+            Trade(
+                index=len(trades) + 1,
+                open_time=open_time,
+                close_time=close_time,
+                symbol=symbol,
+                side=side,
+                lot=parse_fr_number(cols[4]),
+                entry_price=entry_price,
+                exit_price=exit_price,
+                profit=profit,
+                commission=commission,
+                swap=swap,
+                comment=f"position_id={cols[1]} sl={cols[6]} tp={cols[7]}",
+            )
+        )
+
+    report_stats = parse_mt5_results_section(lines)
+    return finalize_mt5_parse(
+        trades=trades,
+        headers=headers,
+        ignored_rows=ignored_rows,
+        non_empty_rows=non_empty_rows,
+        parse_warning="CSV MT5 non reconnu ou colonnes incompatibles" if non_empty_rows > 0 and len(trades) == 0 else None,
+        report_stats=report_stats,
+        source_format="mt5_report_tabulated",
+    )
+
+
+def parse_mt5_results_section(lines: List[str]) -> Dict[str, float]:
+    stats: Dict[str, float] = {}
+    start_idx = next((i for i, line in enumerate(lines) if line.strip().lower() in {"résultats", "resultats", "results"}), None)
+    if start_idx is None:
+        return stats
+
+    for line in lines[start_idx + 1 :]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.lower() in {"positions", "ordres", "orders", "transactions"}:
+            break
+        cols = [c.strip() for c in line.split("\t") if c.strip()]
+        if len(cols) < 2:
+            continue
+        key = normalize_name(cols[0])
+        value = parse_fr_number(cols[1])
+        if value is None:
+            continue
+        if key in {"nbtrades", "nombretrades", "totaltrades", "trades"}:
+            stats["nb_trades"] = value
+        if key in {"profittotalnet", "netprofit", "profitnet"}:
+            stats["profit_total_net"] = value
+    return stats
+
+
+def parse_mt5_simple_csv(path: Path) -> Dict[str, Any]:
     trades: List[Trade] = []
     headers: List[str] = []
     ignored_rows = 0
@@ -326,7 +493,33 @@ def parse_mt5(path: Path) -> Dict[str, Any]:
     except OSError as exc:
         return {"warning": f"Impossible de lire {path.name}: {exc}", "trades": [], "headers": []}
 
+    return finalize_mt5_parse(
+        trades=trades,
+        headers=headers,
+        ignored_rows=ignored_rows,
+        non_empty_rows=non_empty_rows,
+        parse_warning="CSV MT5 non reconnu ou colonnes incompatibles" if non_empty_rows > 0 and len(trades) == 0 else None,
+        report_stats={},
+        source_format="simple_csv",
+    )
+
+
+def finalize_mt5_parse(
+    trades: List[Trade],
+    headers: List[str],
+    ignored_rows: int,
+    non_empty_rows: int,
+    parse_warning: Optional[str],
+    report_stats: Dict[str, float],
+    source_format: str,
+) -> Dict[str, Any]:
+
     profits = [t.profit for t in trades if t.profit is not None]
+    net_results = []
+    for t in trades:
+        if t.profit is None:
+            continue
+        net_results.append(t.profit + (t.commission or 0.0) + (t.swap or 0.0))
     positives = [p for p in profits if p > 0]
     negatives = [p for p in profits if p < 0]
     zeros = [p for p in profits if p == 0]
@@ -338,22 +531,20 @@ def parse_mt5(path: Path) -> Dict[str, Any]:
 
     first_trade = min((t.open_time for t in trades if t.open_time), default=None)
     last_trade = max((t.close_time or t.open_time for t in trades if (t.close_time or t.open_time)), default=None)
-    parse_warning = None
-    if non_empty_rows > 0 and len(trades) == 0:
-        parse_warning = "CSV MT5 non reconnu ou colonnes incompatibles"
-
     return {
         "warning": parse_warning,
         "headers": headers,
         "trades": trades,
         "ignored_rows": ignored_rows,
         "non_empty_rows": non_empty_rows,
+        "source_format": source_format,
+        "report_stats": report_stats,
         "metrics": {
             "total_trades": len(trades),
             "tp_count": len(positives),
             "sl_count": len(negatives),
             "be_count": len(zeros),
-            "profit_net": sum(profits) if profits else 0.0,
+            "profit_net": sum(net_results) if net_results else 0.0,
             "avg_gain": statistics.mean(positives) if positives else None,
             "avg_loss": statistics.mean(negatives) if negatives else None,
             "best_trade": max(profits) if profits else None,
@@ -518,6 +709,13 @@ def detect_anomalies(console: Dict[str, Any], snaps: Dict[str, Any], mt5: Dict[s
     if mt5_trades > 0 and close_detected == 0:
         anomalies.append("Fermeture MT5 non détectée dans la console")
 
+    report_stats = mt5.get("report_stats", {}) or {}
+    report_nb_trades = report_stats.get("nb_trades")
+    if report_nb_trades is not None and int(report_nb_trades) != mt5_trades:
+        anomalies.append(
+            f"Incohérence MT5: trades parsés={mt5_trades} vs Nb trades rapport={int(report_nb_trades)}"
+        )
+
     return anomalies_high + anomalies
 
 
@@ -528,6 +726,7 @@ def fmt_dt(dt: Optional[datetime]) -> str:
 def build_html(base_dir: Path, out_dir: Path, console: Dict[str, Any], snaps: Dict[str, Any], mt5: Dict[str, Any], charts: Dict[str, Any], contexts: List[Dict[str, Any]], anomalies: List[str]) -> str:
     metrics = mt5.get("metrics", {})
     counts = console.get("event_counts", {})
+    report_stats = mt5.get("report_stats", {}) or {}
     day_status, day_conclusion = evaluate_day(metrics, counts)
 
     def rel(path: Path) -> str:
@@ -622,6 +821,7 @@ th,td {{ border: 1px solid #ccc; padding: 6px; font-size: 13px; text-align: left
 
 <h2>2) Analyse MT5</h2>
 <p class="muted">Lignes MT5 ignorées (vides/inexploitables): {mt5.get('ignored_rows', 0)}</p>
+<p class="muted">Format détecté: {mt5.get('source_format', 'unknown')} | Contrôle Résultats: Nb trades={report_stats.get('nb_trades', 'N/A')}, Profit Total Net={report_stats.get('profit_total_net', 'N/A')}</p>
 <table>
 <tr><th>#</th><th>Ouverture</th><th>Fermeture</th><th>Symbole</th><th>Sens</th><th>Lot</th><th>Entrée</th><th>Sortie</th><th>Profit</th><th>Durée</th></tr>
 {''.join(trade_rows) if trade_rows else '<tr><td colspan="10">Aucun trade</td></tr>'}
@@ -686,6 +886,7 @@ th,td {{ border: 1px solid #ccc; padding: 6px; font-size: 13px; text-align: left
 def build_resume(mt5: Dict[str, Any], console: Dict[str, Any], snaps: Dict[str, Any], anomalies: List[str]) -> str:
     m = mt5.get("metrics", {})
     counts = console.get("event_counts", {})
+    report_stats = mt5.get("report_stats", {}) or {}
     day_status, day_conclusion = evaluate_day(m, counts)
 
     lines = [
@@ -693,6 +894,7 @@ def build_resume(mt5: Dict[str, Any], console: Dict[str, Any], snaps: Dict[str, 
         f"Trades={m.get('total_trades', 0)} | Net={m.get('profit_net', 0.0):.2f} | TP/SL/BE={m.get('tp_count', 0)}/{m.get('sl_count', 0)}/{m.get('be_count', 0)}",
         f"Jour: {day_status} | Conclusion: {day_conclusion}",
         f"Console: GPT_TIMEOUT={counts.get('GPT_TIMEOUT', 0)}, M5_TOO_FAR={counts.get('M5_TOO_FAR', 0)}, OUT_OF_SESSION={counts.get('OUT_OF_SESSION', 0)}, ALLOW={counts.get('ALLOW', 0)}, BLOCK={counts.get('BLOCK', 0)}",
+        f"Contrôle rapport MT5: Nb trades={report_stats.get('nb_trades', 'N/A')}, Profit Total Net={report_stats.get('profit_total_net', 'N/A')} (sans remplacer le parsing Positions)",
         f"Snapshots: valides={len(snaps.get('records', []))}, invalides={len(snaps.get('invalid_lines', []))}, spread_moyen={snaps.get('spread_avg')}, distance_m5_moyenne={snaps.get('m5_distance_avg')}",
         "Skips importants (console): "
         + ", ".join(
