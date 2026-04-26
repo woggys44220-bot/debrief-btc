@@ -31,6 +31,8 @@ CONSOLE_EVENTS = [
     "REENTRY_TOO_CLOSE",
     "ENTRY_FILTER_SKIP",
     "GPT_BLOCK",
+    "TIMEOUTERROR_FALLBACK_ALLOW",
+    "TIMEOUT_FALLBACK_ALLOW",
 ]
 
 ERROR_PATTERNS = [
@@ -249,6 +251,8 @@ def parse_mt5(path: Path) -> Dict[str, Any]:
 
     trades: List[Trade] = []
     headers: List[str] = []
+    ignored_rows = 0
+    non_empty_rows = 0
 
     try:
         with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
@@ -276,17 +280,44 @@ def parse_mt5(path: Path) -> Dict[str, Any]:
             col_comment = detect_column(headers, ["comment", "commentaire", "note"])
 
             for idx, row in enumerate(reader, start=1):
+                row_values = [str(v).strip() for v in row.values() if v is not None]
+                if not any(row_values):
+                    ignored_rows += 1
+                    continue
+
+                non_empty_rows += 1
+                open_time = parse_datetime(row.get(col_open)) if col_open else None
+                close_time = parse_datetime(row.get(col_close)) if col_close else None
+                symbol = str(row.get(col_symbol, "")).strip() if col_symbol else ""
+                side = str(row.get(col_side, "")).strip().upper() if col_side else ""
+                entry_price = safe_float(row.get(col_entry)) if col_entry else None
+                profit = safe_float(row.get(col_profit)) if col_profit else None
+
+                # Règle demandée: ne pas compter les lignes vides/inexploitables comme trades.
+                has_core_data = any(
+                    (
+                        open_time is not None or close_time is not None,
+                        bool(symbol),
+                        bool(side),
+                        entry_price is not None,
+                        profit is not None,
+                    )
+                )
+                if not has_core_data:
+                    ignored_rows += 1
+                    continue
+
                 trades.append(
                     Trade(
                         index=idx,
-                        open_time=parse_datetime(row.get(col_open)) if col_open else None,
-                        close_time=parse_datetime(row.get(col_close)) if col_close else None,
-                        symbol=str(row.get(col_symbol, "")).strip() if col_symbol else "",
-                        side=str(row.get(col_side, "")).strip().upper() if col_side else "",
+                        open_time=open_time,
+                        close_time=close_time,
+                        symbol=symbol,
+                        side=side,
                         lot=safe_float(row.get(col_lot)) if col_lot else None,
-                        entry_price=safe_float(row.get(col_entry)) if col_entry else None,
+                        entry_price=entry_price,
                         exit_price=safe_float(row.get(col_exit)) if col_exit else None,
-                        profit=safe_float(row.get(col_profit)) if col_profit else None,
+                        profit=profit,
                         commission=safe_float(row.get(col_comm)) if col_comm else None,
                         swap=safe_float(row.get(col_swap)) if col_swap else None,
                         comment=str(row.get(col_comment, "")).strip() if col_comment else "",
@@ -307,11 +338,16 @@ def parse_mt5(path: Path) -> Dict[str, Any]:
 
     first_trade = min((t.open_time for t in trades if t.open_time), default=None)
     last_trade = max((t.close_time or t.open_time for t in trades if (t.close_time or t.open_time)), default=None)
+    parse_warning = None
+    if non_empty_rows > 0 and len(trades) == 0:
+        parse_warning = "CSV MT5 non reconnu ou colonnes incompatibles"
 
     return {
-        "warning": None,
+        "warning": parse_warning,
         "headers": headers,
         "trades": trades,
+        "ignored_rows": ignored_rows,
+        "non_empty_rows": non_empty_rows,
         "metrics": {
             "total_trades": len(trades),
             "tp_count": len(positives),
@@ -451,8 +487,12 @@ def evaluate_day(mt5_metrics: Dict[str, Any], console_counts: Dict[str, int]) ->
 
 
 def detect_anomalies(console: Dict[str, Any], snaps: Dict[str, Any], mt5: Dict[str, Any], contexts: List[Dict[str, Any]]) -> List[str]:
+    anomalies_high = []
     anomalies = []
     counts = console.get("event_counts", {})
+    timeout_fallback_allow = counts.get("TIMEOUTERROR_FALLBACK_ALLOW", 0) + counts.get("TIMEOUT_FALLBACK_ALLOW", 0)
+    if timeout_fallback_allow > 0:
+        anomalies_high.append("DANGER : GPT timeout fallback ALLOW détecté")
     if counts.get("GPT_TIMEOUT", 0) > 0:
         anomalies.append(f"GPT_TIMEOUT détecté: {counts.get('GPT_TIMEOUT', 0)}")
     if counts.get("GPT_TIMEOUT", 0) > 0 and counts.get("ALLOW", 0) > 0:
@@ -478,7 +518,7 @@ def detect_anomalies(console: Dict[str, Any], snaps: Dict[str, Any], mt5: Dict[s
     if mt5_trades > 0 and close_detected == 0:
         anomalies.append("Fermeture MT5 non détectée dans la console")
 
-    return anomalies
+    return anomalies_high + anomalies
 
 
 def fmt_dt(dt: Optional[datetime]) -> str:
@@ -522,8 +562,35 @@ def build_html(base_dir: Path, out_dir: Path, console: Dict[str, Any], snaps: Di
             "</div>"
         )
 
-    top_skips = snaps.get("skip_reasons", Counter()).most_common(8)
-    skip_items = "".join(f"<li>{html.escape(k)}: {v}</li>" for k, v in top_skips) or "<li>Aucune</li>"
+    priority_skips = [
+        "ENTRY_FILTER_SKIP",
+        "M5_TOO_FAR",
+        "OUT_OF_SESSION",
+        "REENTRY_TOO_CLOSE",
+        "GPT_BLOCK",
+        "WAIT_1",
+        "WAIT_2",
+    ]
+    skip_lines = []
+    for key in priority_skips:
+        value = counts.get(key, 0)
+        if value > 0:
+            skip_lines.append((key, value))
+    skip_items = "".join(f"<li>{html.escape(k)}: {v}</li>" for k, v in skip_lines) or "<li>Aucune</li>"
+
+    skip_interpretation = []
+    if counts.get("M5_TOO_FAR", 0) > 0:
+        skip_interpretation.append("beaucoup de M5_TOO_FAR = filtre possiblement strict")
+    if counts.get("OUT_OF_SESSION", 0) > 0:
+        skip_interpretation.append("beaucoup de OUT_OF_SESSION = normal si logs hors session, sauf si trade hors session")
+    if counts.get("REENTRY_TOO_CLOSE", 0) > 0:
+        skip_interpretation.append("beaucoup de REENTRY_TOO_CLOSE = pacing / cooldown actif")
+    if counts.get("GPT_BLOCK", 0) > 0:
+        skip_interpretation.append("beaucoup de GPT_BLOCK = GPT filtre activement")
+    if counts.get("ENTRY_FILTER_SKIP", 0) > 0:
+        skip_interpretation.append("beaucoup de ENTRY_FILTER_SKIP = filtres techniques très actifs")
+    if not skip_interpretation:
+        skip_interpretation.append("Aucune interprétation: aucun skip important détecté.")
 
     anomalies_html = "".join(f"<li>{html.escape(a)}</li>" for a in anomalies) or "<li>Aucune anomalie détectée</li>"
 
@@ -554,6 +621,7 @@ th,td {{ border: 1px solid #ccc; padding: 6px; font-size: 13px; text-align: left
 </ul>
 
 <h2>2) Analyse MT5</h2>
+<p class="muted">Lignes MT5 ignorées (vides/inexploitables): {mt5.get('ignored_rows', 0)}</p>
 <table>
 <tr><th>#</th><th>Ouverture</th><th>Fermeture</th><th>Symbole</th><th>Sens</th><th>Lot</th><th>Entrée</th><th>Sortie</th><th>Profit</th><th>Durée</th></tr>
 {''.join(trade_rows) if trade_rows else '<tr><td colspan="10">Aucun trade</td></tr>'}
@@ -580,7 +648,7 @@ th,td {{ border: 1px solid #ccc; padding: 6px; font-size: 13px; text-align: left
 
 <h2>6) Skips importants</h2>
 <ul>{skip_items}</ul>
-<p class="muted">Interprétation: skip probablement justifié / à vérifier / trop strict selon fréquence et contexte trade.</p>
+<ul>{''.join(f'<li>{html.escape(item)}</li>' for item in skip_interpretation)}</ul>
 
 <h2>7) Anomalies</h2>
 <ul>{anomalies_html}</ul>
@@ -590,7 +658,7 @@ th,td {{ border: 1px solid #ccc; padding: 6px; font-size: 13px; text-align: left
 <li><b>À changer maintenant:</b> {'rien à changer' if metrics.get('profit_net', 0) > 0 and len(anomalies) == 0 else 'vérifier filtres dominants et anomalies clés'}</li>
 <li><b>À observer encore:</b> qualité des entrées vs M5_TOO_FAR, timeouts GPT, contexte session.</li>
 <li><b>À ne pas toucher:</b> lot size, horaires de session, SL/TP, trade cap, logique qui semble fonctionner.</li>
-<li><b>Priorité numéro 1:</b> {html.escape(anomalies[0] if anomalies else 'Confirmer la stabilité sur plusieurs journées avant tout changement.')}</li>
+<li><b>Priorité numéro 1:</b> {html.escape('Corriger la logique GPT timeout : jamais d’ALLOW automatique sur timeout' if any('DANGER : GPT timeout fallback ALLOW détecté' in a for a in anomalies) else (anomalies[0] if anomalies else 'Confirmer la stabilité sur plusieurs journées avant tout changement.'))}</li>
 </ul>
 
 <h2>9) Questions pour ChatGPT</h2>
@@ -626,9 +694,21 @@ def build_resume(mt5: Dict[str, Any], console: Dict[str, Any], snaps: Dict[str, 
         f"Jour: {day_status} | Conclusion: {day_conclusion}",
         f"Console: GPT_TIMEOUT={counts.get('GPT_TIMEOUT', 0)}, M5_TOO_FAR={counts.get('M5_TOO_FAR', 0)}, OUT_OF_SESSION={counts.get('OUT_OF_SESSION', 0)}, ALLOW={counts.get('ALLOW', 0)}, BLOCK={counts.get('BLOCK', 0)}",
         f"Snapshots: valides={len(snaps.get('records', []))}, invalides={len(snaps.get('invalid_lines', []))}, spread_moyen={snaps.get('spread_avg')}, distance_m5_moyenne={snaps.get('m5_distance_avg')}",
-        "Top skip reasons: " + ", ".join(f"{k}={v}" for k, v in snaps.get("skip_reasons", Counter()).most_common(5)) if snaps.get("skip_reasons") else "Top skip reasons: N/A",
+        "Skips importants (console): "
+        + ", ".join(
+            f"{k}={counts.get(k, 0)}"
+            for k in ["ENTRY_FILTER_SKIP", "M5_TOO_FAR", "OUT_OF_SESSION", "REENTRY_TOO_CLOSE", "GPT_BLOCK", "WAIT_1", "WAIT_2"]
+            if counts.get(k, 0) > 0
+        )
+        if any(counts.get(k, 0) > 0 for k in ["ENTRY_FILTER_SKIP", "M5_TOO_FAR", "OUT_OF_SESSION", "REENTRY_TOO_CLOSE", "GPT_BLOCK", "WAIT_1", "WAIT_2"])
+        else "Skips importants (console): N/A",
         "Anomalies: " + (" | ".join(anomalies[:8]) if anomalies else "aucune"),
-        "Priorité #1: " + (anomalies[0] if anomalies else "Confirmer la stabilité multi-jours avant tout changement."),
+        "Priorité #1: "
+        + (
+            "Corriger la logique GPT timeout : jamais d’ALLOW automatique sur timeout"
+            if any("DANGER : GPT timeout fallback ALLOW détecté" in a for a in anomalies)
+            else (anomalies[0] if anomalies else "Confirmer la stabilité multi-jours avant tout changement.")
+        ),
     ]
     return "\n".join(lines) + "\n"
 

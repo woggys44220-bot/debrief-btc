@@ -53,6 +53,8 @@ Dans `OUTPUT/`:
 
 3. **mt5_history.csv**
    - détecte automatiquement séparateur et colonnes proches (même si les noms varient)
+   - ignore les lignes vides/inexploitables (non comptées comme trades)
+   - si des lignes non vides existent mais restent non parsables, remonte l'anomalie: `CSV MT5 non reconnu ou colonnes incompatibles`
    - calcule: nombre de trades, TP/SL/BE, net total, moyennes gains/pertes, meilleur/pire trade, horaires, durée moyenne
 
 4. **charts/**
@@ -67,6 +69,8 @@ Dans `OUTPUT/`:
 - Fichier vide: pas de crash
 - JSON invalide: pas de crash
 - Colonnes MT5 variables: mapping flexible
+- Timeout GPT fallback ALLOW détecté: remonté en anomalie prioritaire (`DANGER : GPT timeout fallback ALLOW détecté`)
+- Section **Skips importants** basée sur les événements console (ENTRY_FILTER_SKIP, M5_TOO_FAR, OUT_OF_SESSION, REENTRY_TOO_CLOSE, GPT_BLOCK, WAIT_1, WAIT_2)
 
 ## Notes
 
