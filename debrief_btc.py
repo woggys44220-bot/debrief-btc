@@ -10,7 +10,7 @@ import re
 import statistics
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -53,6 +53,12 @@ TIME_PATTERNS = [
     "%Y-%m-%dT%H:%M:%S.%f",
 ]
 
+MATCH_WINDOWS_MINUTES = {
+    "entry_before": 10,
+    "entry_after": 5,
+    "exit_around": 5,
+}
+
 
 @dataclass
 class Trade:
@@ -83,10 +89,17 @@ def parse_datetime(value: Any) -> Optional[datetime]:
     text = str(value).strip()
     if not text:
         return None
-    text = text.replace("Z", "")
+    text = text.replace("Z", "+00:00")
+    iso_candidate = text.replace(" ", "T")
+    try:
+        dt = datetime.fromisoformat(iso_candidate)
+        return normalize_to_utc_naive(dt)
+    except ValueError:
+        pass
+
     for fmt in TIME_PATTERNS:
         try:
-            return datetime.strptime(text, fmt)
+            return normalize_to_utc_naive(datetime.strptime(text, fmt))
         except ValueError:
             continue
     for pattern in (
@@ -99,6 +112,12 @@ def parse_datetime(value: Any) -> Optional[datetime]:
         if m:
             return parse_datetime(m.group(1))
     return None
+
+
+def normalize_to_utc_naive(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def safe_float(value: Any) -> Optional[float]:
@@ -262,6 +281,8 @@ def parse_snapshots(path: Path) -> Dict[str, Any]:
             if val is not None:
                 m5_distances.append(val)
                 break
+
+    records.sort(key=lambda r: r.get("_timestamp") or datetime.min)
 
     return {
         "warning": warning,
@@ -634,6 +655,74 @@ def nearest_by_time(items: List[Any], target: datetime, max_minutes: int, time_a
     return out
 
 
+def snapshot_side(snapshot: Dict[str, Any]) -> str:
+    for key in ("side", "signal_side", "direction", "trade_side", "order_side"):
+        value = snapshot.get(key)
+        if value:
+            return str(value)
+    return "N/A"
+
+
+def snapshot_value(snapshot: Dict[str, Any], keys: Tuple[str, ...]) -> str:
+    for key in keys:
+        value = snapshot.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return "N/A"
+
+
+def match_trade_snapshots(
+    trade: Trade, snapshots: List[Dict[str, Any]], windows: Dict[str, int]
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    open_time = trade.open_time
+    close_time = trade.close_time
+    if not open_time and not close_time:
+        return [], {"reason": "trade_sans_horodatage"}
+
+    matched = []
+    closest_before_entry = None
+    closest_before_delta = None
+    min_abs_delta = None
+    first_snapshot = snapshots[0].get("_timestamp") if snapshots else None
+    last_snapshot = snapshots[-1].get("_timestamp") if snapshots else None
+
+    for snap in snapshots:
+        ts = snap.get("_timestamp")
+        if not ts:
+            continue
+        include = False
+        if open_time:
+            if open_time - timedelta(minutes=windows["entry_before"]) <= ts <= open_time + timedelta(
+                minutes=windows["entry_after"]
+            ):
+                include = True
+            if ts <= open_time:
+                delta_before = (open_time - ts).total_seconds()
+                if closest_before_delta is None or delta_before < closest_before_delta:
+                    closest_before_delta = delta_before
+                    closest_before_entry = snap
+        if close_time and close_time - timedelta(minutes=windows["exit_around"]) <= ts <= close_time + timedelta(
+            minutes=windows["exit_around"]
+        ):
+            include = True
+        if include:
+            matched.append(snap)
+
+        reference = open_time or close_time
+        if reference:
+            abs_delta = abs((ts - reference).total_seconds())
+            if min_abs_delta is None or abs_delta < min_abs_delta:
+                min_abs_delta = abs_delta
+
+    debug = {
+        "closest_before_entry": closest_before_entry,
+        "first_snapshot": first_snapshot,
+        "last_snapshot": last_snapshot,
+        "min_abs_delta_minutes": (min_abs_delta / 60.0) if min_abs_delta is not None else None,
+    }
+    return matched, debug
+
+
 def associate_trade_context(mt5: Dict[str, Any], console: Dict[str, Any], snaps: Dict[str, Any], charts: Dict[str, Any]) -> List[Dict[str, Any]]:
     result = []
     trades: List[Trade] = mt5.get("trades", [])
@@ -644,16 +733,25 @@ def associate_trade_context(mt5: Dict[str, Any], console: Dict[str, Any], snaps:
     for t in trades:
         anchor = t.open_time or t.close_time
         if not anchor:
-            result.append({"trade": t, "snapshots": [], "console_events": [], "charts": [], "comment": "contexte incomplet"})
+            result.append(
+                {
+                    "trade": t,
+                    "snapshots": [],
+                    "console_events": [],
+                    "charts": [],
+                    "comment": "association impossible: trade sans open_time/close_time",
+                    "snapshot_debug": {"reason": "trade_sans_horodatage"},
+                }
+            )
             continue
 
-        near_snapshots = [s for s in snapshots if s.get("_timestamp") and abs(s["_timestamp"] - anchor) <= timedelta(minutes=20)]
+        near_snapshots, snapshot_debug = match_trade_snapshots(t, snapshots, MATCH_WINDOWS_MINUTES)
         near_console = [e for e in console_events if e.get("timestamp") and abs(e["timestamp"] - anchor) <= timedelta(minutes=20)]
         near_charts = [c for c in chart_items if c.timestamp and abs(c.timestamp - anchor) <= timedelta(minutes=20)]
 
         comment = "entrée propre"
         if not near_snapshots:
-            comment = "contexte incomplet"
+            comment = "association snapshots échouée (voir diagnostic horaire)"
         elif any("M5_TOO_FAR" in str(e.get("event", "")) for e in near_console):
             comment = "entrée tardive possible"
         elif any("OUT_OF_SESSION" in str(e.get("event", "")) for e in near_console):
@@ -668,6 +766,7 @@ def associate_trade_context(mt5: Dict[str, Any], console: Dict[str, Any], snaps:
                 "console_events": near_console[:8],
                 "charts": near_charts,
                 "comment": comment,
+                "snapshot_debug": snapshot_debug,
             }
         )
     return result
@@ -757,17 +856,44 @@ def build_html(base_dir: Path, out_dir: Path, console: Dict[str, Any], snaps: Di
     context_blocks = []
     for ctx in contexts:
         t: Trade = ctx["trade"]
+        snap_debug = ctx.get("snapshot_debug", {})
+        closest_before = snap_debug.get("closest_before_entry")
         images = " ".join(
             f'<a href="../{html.escape(rel(c.path))}">{html.escape(c.path.name)}</a>' for c in ctx["charts"]
         ) or "Aucune"
         evs = ", ".join(sorted({e["event"] for e in ctx["console_events"]})) or "Aucun"
+        closest_before_line = "Aucun snapshot trouvé avant entrée"
+        if closest_before:
+            closest_before_line = (
+                f"{fmt_dt(closest_before.get('_timestamp'))}"
+                f" | décision GPT={html.escape(snapshot_value(closest_before, ('gpt_decision', 'decision_gpt', 'decision', 'gpt')))}"
+                f" | side={html.escape(snapshot_side(closest_before))}"
+                f" | entry/sl/tp={html.escape(snapshot_value(closest_before, ('entry', 'entry_price')))} /"
+                f"{html.escape(snapshot_value(closest_before, ('sl', 'stop_loss')))} /"
+                f"{html.escape(snapshot_value(closest_before, ('tp', 'take_profit')))}"
+                f" | sniper={html.escape(snapshot_value(closest_before, ('sniper_filters', 'filters', 'entry_filter_skip_reason')))}"
+                f" | M15={html.escape(snapshot_value(closest_before, ('m15_context', 'context_m15', 'm15')))}"
+            )
+
+        diag_line = ""
+        if not ctx["snapshots"]:
+            min_gap = snap_debug.get("min_abs_delta_minutes")
+            min_gap_text = f"{min_gap:.2f} min" if min_gap is not None else "N/A"
+            diag_line = (
+                f"<p><b>Diagnostic association:</b> trade={fmt_dt(t.open_time or t.close_time)} | "
+                f"premier snapshot={fmt_dt(snap_debug.get('first_snapshot'))} | "
+                f"dernier snapshot={fmt_dt(snap_debug.get('last_snapshot'))} | "
+                f"écart minimal={min_gap_text}</p>"
+            )
         context_blocks.append(
             "<div class='card'>"
             f"<h4>Trade #{t.index} — {html.escape(t.side)} — profit={t.profit}</h4>"
             f"<p><b>Heure:</b> {fmt_dt(t.open_time)} | <b>Résultat:</b> {classify_trade_result(t)}</p>"
             f"<p><b>Snapshots proches:</b> {len(ctx['snapshots'])} | <b>Événements console:</b> {html.escape(evs)}</p>"
+            f"<p><b>Snapshot avant entrée (plus proche):</b> {closest_before_line}</p>"
             f"<p><b>Charts liées:</b> {images}</p>"
             f"<p><b>Commentaire automatique:</b> {html.escape(ctx['comment'])}</p>"
+            f"{diag_line}"
             "</div>"
         )
 
@@ -846,6 +972,8 @@ th,td {{ border: 1px solid #ccc; padding: 6px; font-size: 13px; text-align: left
 
 <h2>4) Analyse snapshots</h2>
 <ul>
+<li>Normalisation temporelle: parsing ISO + conversion UTC si offset présent (sinon heure serveur conservée)</li>
+<li>Fenêtres association trade/snapshot: entrée [{MATCH_WINDOWS_MINUTES['entry_before']} min avant, {MATCH_WINDOWS_MINUTES['entry_after']} min après], sortie ±{MATCH_WINDOWS_MINUTES['exit_around']} min</li>
 <li>Nombre de snapshots valides: {len(snaps.get('records', []))}</li>
 <li>Lignes invalides: {len(snaps.get('invalid_lines', []))}</li>
 <li>Champs disponibles: {', '.join(sorted(k for k in snaps.get('fields', {}).keys() if not k.startswith('_'))) or 'N/A'}</li>
