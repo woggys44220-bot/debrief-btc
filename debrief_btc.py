@@ -733,6 +733,14 @@ def has_full_setup(snapshot: Dict[str, Any]) -> bool:
     )
 
 
+def has_side_and_entry(snapshot: Optional[Dict[str, Any]]) -> bool:
+    if not snapshot:
+        return False
+    return snapshot_side(snapshot) in {"BUY", "SELL"} and snapshot_price(
+        snapshot, ("entry", "entry_price", "price", "open_price")
+    ) is not None
+
+
 def price_delta_ok(mt5_price: Optional[float], snapshot_entry: Optional[float]) -> bool:
     if mt5_price is None or snapshot_entry is None:
         return False
@@ -793,13 +801,17 @@ def match_trade_snapshot(trade: Trade, snapshots: List[Dict[str, Any]], anchor: 
     windowed_snapshots = [s for s in snapshots if is_entry_context_window(anchor, s)]
 
     id_candidates = []
+    id_incomplete_candidates = []
     if ids_available:
         for snap in windowed_snapshots:
             if not snap.get("_timestamp"):
                 continue
             for family, value in trade_ids.items():
                 if value and snapshot_identifier(snap, family) == str(value):
-                    id_candidates.append(snap)
+                    if has_side_and_entry(snap):
+                        id_candidates.append(snap)
+                    else:
+                        id_incomplete_candidates.append(snap)
                     break
 
     selected = select_by_time(id_candidates, anchor)
@@ -846,6 +858,11 @@ def match_trade_snapshot(trade: Trade, snapshots: List[Dict[str, Any]], anchor: 
         d_candidates = [s for s in snapshots if s.get("_timestamp") and lower_bound <= s["_timestamp"] <= anchor]
         selected = select_by_time(d_candidates, anchor)
         method = "D:avant entrée (2h)"
+        confidence = "faible"
+
+    if not selected and id_incomplete_candidates:
+        selected = select_by_time(id_incomplete_candidates, anchor)
+        method = "A':matching par ticket seulement, contexte incomplet"
         confidence = "faible"
 
     if not selected:
@@ -901,12 +918,36 @@ def match_trade_snapshot(trade: Trade, snapshots: List[Dict[str, Any]], anchor: 
     selected_time = selected.get("_timestamp")
     selected_entry = snapshot_price(selected, ("entry", "entry_price", "price", "open_price"))
     selected_gap = abs((selected_time - anchor).total_seconds()) / 60.0 if selected_time else None
-    entry_context_usable = is_entry_context_window(anchor, selected)
+    has_entry_fields = has_side_and_entry(selected)
+    entry_context_usable = is_entry_context_window(anchor, selected) and has_entry_fields
     real_confidence = confidence
     if selected_gap is not None and selected_gap > WEAK_CONFIDENCE_GAP_MINUTES:
         real_confidence = "faible"
     if real_confidence == "haute" and (selected_gap is None or selected_gap > WEAK_CONFIDENCE_GAP_MINUTES):
         real_confidence = "moyenne"
+    if not has_entry_fields:
+        real_confidence = "faible"
+
+    prior_buy_close = None
+    if trade.entry_price is not None:
+        prior_buy_candidates = []
+        for snap in windowed_snapshots:
+            ts = snap.get("_timestamp")
+            if not ts or ts > anchor:
+                continue
+            if snapshot_side(snap) != "BUY":
+                continue
+            snap_entry = snapshot_price(snap, ("entry", "entry_price", "price", "open_price"))
+            if price_delta_ok(trade.entry_price, snap_entry):
+                prior_buy_candidates.append(snap)
+        prior_buy_close = select_by_time(prior_buy_candidates, anchor)
+
+    prior_buy_not_retained_reason = ""
+    if prior_buy_close and selected is not prior_buy_close:
+        prior_buy_not_retained_reason = (
+            f"Un snapshot BUY avant entrée ({fmt_dt(prior_buy_close.get('_timestamp'))}) avec entry proche existe, "
+            f"mais non retenu car la méthode prioritaire a sélectionné '{method}'."
+        )
 
     return {
         "selected": selected,
@@ -927,6 +968,10 @@ def match_trade_snapshot(trade: Trade, snapshots: List[Dict[str, Any]], anchor: 
             "snapshot_ticket": snapshot_identifier(selected, "ticket"),
             "snapshot_order": snapshot_identifier(selected, "order"),
             "snapshot_deal": snapshot_identifier(selected, "deal"),
+            "selected_has_side_entry": has_entry_fields,
+            "ticket_match_found": bool(id_candidates or id_incomplete_candidates),
+            "ticket_only_incomplete": method == "A':matching par ticket seulement, contexte incomplet",
+            "prior_buy_not_retained_reason": prior_buy_not_retained_reason,
             "failure_reasons": [],
         },
     }
@@ -1015,6 +1060,11 @@ def associate_trade_context(
         "best_offset_hours": best_offset,
         "matched_trades": best_score[0],
         "weak_trades": sum(1 for c in best_contexts if c.get("association_confidence") == "faible"),
+        "ticket_only_incomplete_trades": sum(
+            1
+            for c in best_contexts
+            if c.get("association_method") == "A':matching par ticket seulement, contexte incomplet"
+        ),
     }
 
 
@@ -1172,7 +1222,7 @@ def build_html(
         before_line = snapshot_summary_line(best_before, trade_anchor, "Meilleur snapshot AVANT entrée")
         after_line = snapshot_summary_line(best_after, trade_anchor, "Meilleur snapshot APRÈS entrée")
         reliable_status, reliable_reason = is_matching_reliable(t, selected_snapshot, snap_debug)
-        context_exploitable = reliable_status in {"OUI", "MOYEN"}
+        context_exploitable = ctx.get("entry_context_usable", False) and reliable_status in {"OUI", "MOYEN"}
         real_gap = snap_debug.get("gap_minutes")
         gpt_decision = (
             snapshot_value(selected_snapshot, ("gpt_decision", "decision_gpt", "decision", "gpt"))
@@ -1198,8 +1248,15 @@ def build_html(
             f"{html.escape(str(snap_debug.get('trade_deal') or 'N/A'))} | "
             f"snapshot ticket/order/deal={html.escape(str(snap_debug.get('snapshot_ticket') or 'N/A'))}/"
             f"{html.escape(str(snap_debug.get('snapshot_order') or 'N/A'))}/"
-            f"{html.escape(str(snap_debug.get('snapshot_deal') or 'N/A'))}</p>"
+            f"{html.escape(str(snap_debug.get('snapshot_deal') or 'N/A'))} | "
+            f"ticket_trouvé={snap_debug.get('ticket_match_found', False)} | "
+            f"contexte_entrée_fiable={snap_debug.get('selected_has_side_entry', False)}</p>"
         )
+        if snap_debug.get("prior_buy_not_retained_reason"):
+            diag_line += (
+                f"<p><b>Pourquoi un BUY avant n'est pas retenu:</b> "
+                f"{html.escape(snap_debug.get('prior_buy_not_retained_reason'))}</p>"
+            )
 
         unmatched_details = ""
         if not selected_snapshot:
@@ -1317,6 +1374,7 @@ th,td {{ border: 1px solid #ccc; padding: 6px; font-size: 13px; text-align: left
 <li>Normalisation temporelle: parsing ISO + conversion UTC si offset présent (sinon heure serveur conservée)</li>
 <li>Offsets testés (trade MT5): {association_meta.get('tested_offsets_hours', [])} | offset retenu: {association_meta.get('best_offset_hours', 0)}h</li>
 <li>Trades avec contexte snapshot exploitable (fenêtre -15/+2 min): {association_meta.get('matched_trades', 0)}/{metrics.get('total_trades', 0)}</li>
+<li>Matching par ticket seulement, contexte incomplet: {association_meta.get('ticket_only_incomplete_trades', 0)}</li>
 <li>Associations faibles: {association_meta.get('weak_trades', 0)}</li>
 <li>Nombre de snapshots valides: {len(snaps.get('records', []))}</li>
 <li>Lignes invalides: {len(snaps.get('invalid_lines', []))}</li>
