@@ -53,8 +53,12 @@ Dans `OUTPUT/`:
 
 3. **mt5_history.csv**
    - détecte automatiquement séparateur et colonnes proches (même si les noms varient)
+   - détecte aussi les rapports MT5/PuPrime tabulés (sections `Positions`, `Ordres`, `Transactions`, `Résultats`)
+   - dans un rapport tabulé, parse en priorité la section `Positions` (lignes entre `Positions` et `Ordres`)
+   - convertit les nombres français (`76 247,00`, `- 15,45`, etc.)
    - ignore les lignes vides/inexploitables (non comptées comme trades)
    - si des lignes non vides existent mais restent non parsables, remonte l'anomalie: `CSV MT5 non reconnu ou colonnes incompatibles`
+   - lit `Résultats` comme contrôle (`Nb trades`, `Profit Total Net`) sans remplacer les trades parsés
    - calcule: nombre de trades, TP/SL/BE, net total, moyennes gains/pertes, meilleur/pire trade, horaires, durée moyenne
 
 4. **charts/**
