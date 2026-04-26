@@ -25,9 +25,6 @@ CONSOLE_EVENTS = [
     "M5_TOO_FAR",
     "OUT_OF_SESSION",
     "CLOSE_DETECTED",
-    "TP",
-    "SL",
-    "BE",
     "REENTRY_TOO_CLOSE",
     "ENTRY_FILTER_SKIP",
     "GPT_BLOCK",
@@ -178,6 +175,12 @@ def parse_console(path: Path) -> Dict[str, Any]:
     matches: List[Dict[str, Any]] = []
     errors: List[str] = []
 
+    close_detected_event_map = {
+        "TP": "CLOSE_DETECTED_TP",
+        "SL": "CLOSE_DETECTED_SL",
+        "BE": "CLOSE_DETECTED_BE",
+    }
+
     for i, line in enumerate(lines, start=1):
         line_upper = line.upper()
         ts = parse_datetime(line)
@@ -185,6 +188,13 @@ def parse_console(path: Path) -> Dict[str, Any]:
             if event in line_upper:
                 event_counts[event] += 1
                 matches.append({"line": i, "timestamp": ts, "event": event, "raw": line})
+
+        if "CLOSE_DETECTED" in line_upper:
+            for token, close_event in close_detected_event_map.items():
+                if token in line_upper:
+                    event_counts[close_event] += 1
+                    matches.append({"line": i, "timestamp": ts, "event": close_event, "raw": line})
+
         if any(re.search(pat, line, flags=re.IGNORECASE) for pat in ERROR_PATTERNS):
             errors.append(f"L{i}: {line}")
 
@@ -831,6 +841,7 @@ th,td {{ border: 1px solid #ccc; padding: 6px; font-size: 13px; text-align: left
 <ul>
 {''.join(f'<li>{k}: {v}</li>' for k, v in sorted(counts.items())) or '<li>Aucun événement détecté</li>'}
 </ul>
+<p class="muted">Mentions techniques SL/TP ignorées pour éviter les faux compteurs.</p>
 <p>Erreurs importantes: {len(console.get('errors', []))}</p>
 
 <h2>4) Analyse snapshots</h2>
