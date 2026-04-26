@@ -752,6 +752,13 @@ def gap_minutes(anchor: datetime, snapshot: Optional[Dict[str, Any]]) -> Optiona
     return abs((snapshot["_timestamp"] - anchor).total_seconds()) / 60.0
 
 
+def min_gap_minutes(anchor: datetime, snapshots: List[Dict[str, Any]]) -> Optional[float]:
+    timed = [s for s in snapshots if s.get("_timestamp")]
+    if not timed:
+        return None
+    return min(abs((s["_timestamp"] - anchor).total_seconds()) / 60.0 for s in timed)
+
+
 def best_snapshot_before(anchor: datetime, snapshots: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     candidates = [s for s in snapshots if s.get("_timestamp") and s["_timestamp"] <= anchor]
     return max(candidates, key=lambda s: s["_timestamp"]) if candidates else None
@@ -842,6 +849,32 @@ def match_trade_snapshot(trade: Trade, snapshots: List[Dict[str, Any]], anchor: 
         confidence = "faible"
 
     if not selected:
+        failure_reasons = []
+        if not windowed_snapshots:
+            failure_reasons.append("Aucun snapshot dans la fenêtre -15/+2 min autour de l'heure normalisée.")
+        if windowed_snapshots and trade_side not in {"BUY", "SELL"}:
+            failure_reasons.append("Side trade MT5 absent ou non normalisable.")
+        if windowed_snapshots and trade.entry_price is None:
+            failure_reasons.append("Entry MT5 absente, impossible de valider la proximité de prix.")
+        if ids_available and not id_candidates:
+            failure_reasons.append("IDs ticket/order/deal présents côté trade mais absents des snapshots proches.")
+        if windowed_snapshots and not any(snapshot_is_order_ok(s) for s in windowed_snapshots):
+            failure_reasons.append("Aucun statut ORDER_OK dans la fenêtre proche.")
+        if windowed_snapshots and trade_side in {"BUY", "SELL"} and trade.entry_price is not None:
+            has_side = any(snapshot_side(s) == trade_side for s in windowed_snapshots)
+            if not has_side:
+                failure_reasons.append("Aucun snapshot proche avec le même side.")
+            else:
+                has_side_entry = any(
+                    price_delta_ok(trade.entry_price, snapshot_price(s, ("entry", "entry_price", "price", "open_price")))
+                    for s in windowed_snapshots
+                    if snapshot_side(s) == trade_side
+                )
+                if not has_side_entry:
+                    failure_reasons.append("Snapshots avec bon side mais entry trop éloignée.")
+        if not failure_reasons:
+            failure_reasons.append("Aucun candidat n'a satisfait les règles de matching.")
+
         return {
             "selected": None,
             "method": "aucune",
@@ -853,6 +886,7 @@ def match_trade_snapshot(trade: Trade, snapshots: List[Dict[str, Any]], anchor: 
                 "trade_time": anchor,
                 "closest_snapshot_time": closest_time,
                 "gap_minutes": closest_gap_min,
+                "min_gap_minutes": min_gap_minutes(anchor, snapshots),
                 "entry_price_diff": abs(trade.entry_price - closest_entry) if trade.entry_price is not None and closest_entry is not None else None,
                 "trade_ticket": trade.ticket,
                 "trade_order": trade.order,
@@ -860,6 +894,7 @@ def match_trade_snapshot(trade: Trade, snapshots: List[Dict[str, Any]], anchor: 
                 "snapshot_ticket": snapshot_identifier(closest_snapshot, "ticket") if closest_snapshot else None,
                 "snapshot_order": snapshot_identifier(closest_snapshot, "order") if closest_snapshot else None,
                 "snapshot_deal": snapshot_identifier(closest_snapshot, "deal") if closest_snapshot else None,
+                "failure_reasons": failure_reasons,
             },
         }
 
@@ -884,6 +919,7 @@ def match_trade_snapshot(trade: Trade, snapshots: List[Dict[str, Any]], anchor: 
             "trade_time": anchor,
             "closest_snapshot_time": closest_time,
             "gap_minutes": selected_gap,
+            "min_gap_minutes": min_gap_minutes(anchor, snapshots),
             "entry_price_diff": abs(trade.entry_price - selected_entry) if trade.entry_price is not None and selected_entry is not None else None,
             "trade_ticket": trade.ticket,
             "trade_order": trade.order,
@@ -891,6 +927,7 @@ def match_trade_snapshot(trade: Trade, snapshots: List[Dict[str, Any]], anchor: 
             "snapshot_ticket": snapshot_identifier(selected, "ticket"),
             "snapshot_order": snapshot_identifier(selected, "order"),
             "snapshot_deal": snapshot_identifier(selected, "deal"),
+            "failure_reasons": [],
         },
     }
 
@@ -922,6 +959,9 @@ def associate_trade_context(
                         "entry_context_usable": False,
                         "best_snapshot_before": None,
                         "best_snapshot_after": None,
+                        "mt5_raw_time": None,
+                        "normalized_trade_time": None,
+                        "offset_hours": offset_hours,
                     }
                 )
                 continue
@@ -955,6 +995,9 @@ def associate_trade_context(
                     "entry_context_usable": entry_context_usable,
                     "best_snapshot_before": assoc.get("before_snapshot"),
                     "best_snapshot_after": assoc.get("after_snapshot"),
+                    "mt5_raw_time": anchor,
+                    "normalized_trade_time": shifted_anchor,
+                    "offset_hours": offset_hours,
                 }
             )
         return items
@@ -1002,6 +1045,7 @@ def detect_anomalies(console: Dict[str, Any], snaps: Dict[str, Any], mt5: Dict[s
     timeout_fallback_allow = counts.get("TIMEOUTERROR_FALLBACK_ALLOW", 0) + counts.get("TIMEOUT_FALLBACK_ALLOW", 0)
     if timeout_fallback_allow > 0:
         anomalies_high.append("DANGER : GPT timeout fallback ALLOW détecté")
+        anomalies_high.append("GPT_TIMEOUT_FALLBACK_ALLOW détecté : corrigé dans V12C, mais dangereux dans les anciens bots.")
     if counts.get("GPT_TIMEOUT", 0) > 0:
         anomalies.append(f"GPT_TIMEOUT détecté: {counts.get('GPT_TIMEOUT', 0)}")
     if counts.get("GPT_TIMEOUT", 0) > 0 and counts.get("ALLOW", 0) > 0:
@@ -1056,6 +1100,62 @@ def snapshot_summary_line(snapshot: Optional[Dict[str, Any]], anchor: Optional[d
     )
 
 
+def is_matching_reliable(trade: Trade, snapshot: Optional[Dict[str, Any]], diagnostic: Dict[str, Any]) -> Tuple[bool, str]:
+    if not snapshot:
+        return False, "Aucun snapshot retenu."
+    reasons = []
+    reliable = True
+    trade_side = normalize_side(trade.side)
+    snap_side = snapshot_side(snapshot)
+    if trade_side in {"BUY", "SELL"} and snap_side == trade_side:
+        reasons.append("même side")
+    else:
+        reasons.append("side différent ou absent")
+        reliable = False
+
+    trade_entry = trade.entry_price
+    snap_entry = snapshot_price(snapshot, ("entry", "entry_price", "price", "open_price"))
+    if price_delta_ok(trade_entry, snap_entry):
+        reasons.append("même entry (tolérance)")
+    else:
+        reasons.append("entry non proche")
+        reliable = False
+
+    id_match = False
+    for family, trade_value in {"ticket": trade.ticket, "order": trade.order, "deal": trade.deal}.items():
+        if trade_value and snapshot_identifier(snapshot, family) == str(trade_value):
+            id_match = True
+            break
+    reasons.append("même order/ticket/deal" if id_match else "order/ticket/deal non confirmés")
+    if not id_match:
+        reliable = False
+
+    gap = diagnostic.get("gap_minutes")
+    reasons.append(f"écart après offset={gap:.2f} min" if gap is not None else "écart après offset=N/A")
+    if gap is None or gap > WEAK_CONFIDENCE_GAP_MINUTES:
+        reliable = False
+    return reliable, ", ".join(reasons)
+
+
+def should_generate_auto_comment(
+    ctx: Dict[str, Any], trade: Trade, snapshot: Optional[Dict[str, Any]], diagnostic: Dict[str, Any]
+) -> bool:
+    if not ctx.get("entry_context_usable") or not snapshot:
+        return False
+    if normalize_side(trade.side) not in {"BUY", "SELL"}:
+        return False
+    if trade.entry_price is None:
+        return False
+    has_gpt_decision = snapshot_value(snapshot, ("gpt_decision", "decision_gpt", "decision", "gpt")) != "N/A"
+    has_id_match = any(
+        trade_value and snapshot_identifier(snapshot, family) == str(trade_value)
+        for family, trade_value in {"ticket": trade.ticket, "order": trade.order, "deal": trade.deal}.items()
+    )
+    gap = diagnostic.get("gap_minutes")
+    has_close_snapshot = gap is not None and gap <= 2.0
+    return has_gpt_decision or has_id_match or has_close_snapshot
+
+
 def build_html(
     base_dir: Path,
     out_dir: Path,
@@ -1088,13 +1188,17 @@ def build_html(
         )
 
     context_blocks = []
+    timed_snapshots = [s for s in snaps.get("records", []) if s.get("_timestamp")]
+    first_snapshot = min(timed_snapshots, key=lambda s: s["_timestamp"]) if timed_snapshots else None
+    last_snapshot = max(timed_snapshots, key=lambda s: s["_timestamp"]) if timed_snapshots else None
     for ctx in contexts:
         t: Trade = ctx["trade"]
-        trade_anchor = t.open_time or t.close_time
+        trade_anchor = ctx.get("normalized_trade_time") or (t.open_time or t.close_time)
         snap_debug = ctx.get("snapshot_debug", {})
         selected_snapshot = ctx["snapshots"][0] if ctx["snapshots"] else None
         best_before = ctx.get("best_snapshot_before")
         best_after = ctx.get("best_snapshot_after")
+        offset_hours = ctx.get("offset_hours", association_meta.get("best_offset_hours", 0))
         images = " ".join(
             f'<a href="../{html.escape(rel(c.path))}">{html.escape(c.path.name)}</a>' for c in ctx["charts"]
         ) or "Aucune"
@@ -1102,6 +1206,17 @@ def build_html(
 
         before_line = snapshot_summary_line(best_before, trade_anchor, "Meilleur snapshot AVANT entrée")
         after_line = snapshot_summary_line(best_after, trade_anchor, "Meilleur snapshot APRÈS entrée")
+        reliable, reliable_reason = is_matching_reliable(t, selected_snapshot, snap_debug)
+        real_gap = snap_debug.get("gap_minutes")
+        gpt_decision = (
+            snapshot_value(selected_snapshot, ("gpt_decision", "decision_gpt", "decision", "gpt"))
+            if selected_snapshot
+            else "N/A"
+        )
+        if should_generate_auto_comment(ctx, t, selected_snapshot, snap_debug):
+            auto_comment = ctx["comment"]
+        else:
+            auto_comment = "Commentaire qualité non généré: données insuffisantes (snapshot/side/entry/décision)."
 
         diag_line = ""
         gap = snap_debug.get("gap_minutes")
@@ -1118,10 +1233,29 @@ def build_html(
             f"{html.escape(str(snap_debug.get('snapshot_order') or 'N/A'))}/"
             f"{html.escape(str(snap_debug.get('snapshot_deal') or 'N/A'))}</p>"
         )
+
+        unmatched_details = ""
+        if not selected_snapshot:
+            failure_reasons = snap_debug.get("failure_reasons", [])
+            min_gap = snap_debug.get("min_gap_minutes")
+            unmatched_details = (
+                "<p><b>Matching échoué:</b> "
+                + html.escape(" | ".join(failure_reasons) if failure_reasons else "Raison non disponible")
+                + "</p>"
+                + f"<p><b>Premier snapshot du fichier:</b> {fmt_dt(first_snapshot.get('_timestamp')) if first_snapshot else 'Aucun'}"
+                + f" | <b>Dernier snapshot du fichier:</b> {fmt_dt(last_snapshot.get('_timestamp')) if last_snapshot else 'Aucun'}</p>"
+                + f"<p><b>Écart minimal après offset:</b> {f'{min_gap:.2f} min' if min_gap is not None else 'N/A'}</p>"
+            )
+
         context_blocks.append(
             "<div class='card'>"
             f"<h4>Trade #{t.index} — {html.escape(t.side)} — profit={t.profit}</h4>"
-            f"<p><b>Heure:</b> {fmt_dt(t.open_time)} | <b>Résultat:</b> {classify_trade_result(t)}</p>"
+            f"<p><b>Heure MT5 brute:</b> {fmt_dt(ctx.get('mt5_raw_time'))} | "
+            f"<b>Offset appliqué:</b> {offset_hours:+d}h | "
+            f"<b>Heure normalisée (matching):</b> {fmt_dt(trade_anchor)} | "
+            f"<b>Heure snapshot retenu:</b> {fmt_dt(selected_snapshot.get('_timestamp')) if selected_snapshot else 'Aucun'} | "
+            f"<b>Écart réel après offset:</b> {f'{real_gap:.2f} min' if real_gap is not None else 'N/A'}</p>"
+            f"<p><b>Résultat:</b> {classify_trade_result(t)}</p>"
             f"<p><b>Snapshots associés:</b> {len(ctx['snapshots'])} | <b>Événements console:</b> {html.escape(evs)}</p>"
             f"<p><b>Méthode d'association:</b> {html.escape(ctx.get('association_method', 'N/A'))} | "
             f"<b>Confiance:</b> {html.escape(ctx.get('association_confidence', 'faible'))}</p>"
@@ -1129,9 +1263,12 @@ def build_html(
             f"<p><b>{after_line}</b></p>"
             f"<p><b>Snapshot retenu pour contexte d'entrée:</b> {fmt_dt(selected_snapshot.get('_timestamp')) if selected_snapshot else 'Aucun'} | "
             f"<b>Contexte exploitable:</b> {'oui' if ctx.get('entry_context_usable') else 'non'}</p>"
+            f"<p><b>Matching fiable:</b> {'OUI' if reliable else 'NON'} | <b>Raison:</b> {html.escape(reliable_reason)} | "
+            f"<b>Décision GPT snapshot:</b> {html.escape(gpt_decision)}</p>"
             f"<p><b>Charts liées:</b> {images}</p>"
-            f"<p><b>Commentaire automatique:</b> {html.escape(ctx['comment'])}</p>"
+            f"<p><b>Commentaire automatique:</b> {html.escape(auto_comment)}</p>"
             f"{diag_line}"
+            f"{unmatched_details}"
             "</div>"
         )
 
