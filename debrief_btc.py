@@ -670,6 +670,85 @@ def classify_trade_result(trade: Trade) -> str:
     return "BE"
 
 
+
+
+def is_bot_lot(lot: Optional[float]) -> bool:
+    return lot is not None and abs(lot - 0.05) < 1e-9
+
+
+def classify_trade_origin(trade: Trade, snapshots: List[Dict[str, Any]]) -> str:
+    if not is_bot_lot(trade.lot):
+        return "manuel/inconnu"
+
+    trade_ids = {"ticket": trade.ticket, "order": trade.order, "deal": trade.deal}
+    for snap in snapshots:
+        if not snapshot_is_order_ok(snap):
+            continue
+        for family, value in trade_ids.items():
+            if value and snapshot_identifier(snap, family) == str(value):
+                return "bot"
+
+    # fallback: lot bot + ticket présent côté trade => bot probable
+    if trade.ticket:
+        return "bot"
+    return "manuel/inconnu"
+
+
+def summarize_trade_detection(mt5: Dict[str, Any], snaps: Dict[str, Any]) -> Dict[str, Any]:
+    trades: List[Trade] = mt5.get("trades", [])
+    snapshots: List[Dict[str, Any]] = snaps.get("records", [])
+
+    bot_trades = []
+    manual_unknown_trades = []
+    open_trades = []
+    closed_trades = []
+
+    matched_snapshot_keys = set()
+    matching_ticket = False
+
+    for t in trades:
+        origin = classify_trade_origin(t, snapshots)
+        if origin == "bot":
+            bot_trades.append(t)
+        else:
+            manual_unknown_trades.append(t)
+
+        if t.close_time is None:
+            open_trades.append(t)
+        else:
+            closed_trades.append(t)
+
+        if is_bot_lot(t.lot):
+            for s in snapshots:
+                if not snapshot_is_order_ok(s):
+                    continue
+                for family, value in (("ticket", t.ticket), ("order", t.order), ("deal", t.deal)):
+                    if value and snapshot_identifier(s, family) == str(value):
+                        matching_ticket = True
+                        matched_snapshot_keys.add(id(s))
+                        break
+
+    order_ok_snaps = [s for s in snapshots if snapshot_is_order_ok(s)]
+    unmatched_order_ok = [s for s in order_ok_snaps if id(s) not in matched_snapshot_keys]
+
+    unknown_closed_snapshots = []
+    for s in snapshots:
+        status = str(s.get("status") or s.get("event") or "").upper()
+        if "UNKNOWN" in status and any(k in status for k in ("CLOSE", "CLOSED", "FERME")):
+            unknown_closed_snapshots.append(s)
+
+    return {
+        "bot_trades": bot_trades,
+        "manual_unknown_trades": manual_unknown_trades,
+        "open_trades": open_trades,
+        "closed_trades": closed_trades,
+        "unmatched_order_ok": unmatched_order_ok,
+        "unknown_closed_snapshots": unknown_closed_snapshots,
+        "matching_ticket": matching_ticket,
+        "mt5_read_ok": bool(trades) or not bool(mt5.get("warning")),
+        "snapshots_read_ok": bool(snapshots) or not bool(snaps.get("warning")),
+    }
+
 def normalize_side(value: str) -> str:
     text = (value or "").strip().upper()
     if "BUY" in text or text in {"B", "LONG", "ACHAT"}:
@@ -1101,7 +1180,9 @@ def detect_anomalies(console: Dict[str, Any], snaps: Dict[str, Any], mt5: Dict[s
     if snaps.get("invalid_lines"):
         anomalies.append(f"Snapshots invalides: {len(snaps['invalid_lines'])} lignes")
     if mt5.get("metrics", {}).get("total_trades", 0) == 0:
-        anomalies.append("Historique MT5 vide ou sans trades")
+        detection = summarize_trade_detection(mt5, snaps)
+        if len(detection.get("bot_trades", [])) == 0:
+            anomalies.append("Historique MT5 vide ou sans trades")
 
     for ctx in contexts:
         trade: Trade = ctx["trade"]
@@ -1186,6 +1267,7 @@ def build_html(
     counts = console.get("event_counts", {})
     report_stats = mt5.get("report_stats", {}) or {}
     day_status, day_conclusion = evaluate_day(metrics, counts)
+    detection = summarize_trade_detection(mt5, snaps)
 
     def rel(path: Path) -> str:
         return str(path.relative_to(out_dir.parent)).replace("\\", "/")
@@ -1354,6 +1436,25 @@ th,td {{ border: 1px solid #ccc; padding: 6px; font-size: 13px; text-align: left
 <li>Conclusion rapide: {html.escape(day_conclusion)}</li>
 </ul>
 
+<h2>1bis) Fiabilité du rapport</h2>
+<ul>
+<li>MT5 lu : {'OUI' if detection.get('mt5_read_ok') else 'NON'}</li>
+<li>snapshots lus : {'OUI' if detection.get('snapshots_read_ok') else 'NON'}</li>
+<li>matching ticket : {'OUI' if detection.get('matching_ticket') else 'NON'}</li>
+<li>trades manuels détectés : {len(detection.get('manual_unknown_trades', []))}</li>
+<li>trades bot détectés : {len(detection.get('bot_trades', []))}</li>
+</ul>
+
+<h2>1ter) Distinction des trades</h2>
+<ul>
+<li>Trades bot détectés: {len(detection.get('bot_trades', []))}</li>
+<li>Trades manuels / inconnus: {len(detection.get('manual_unknown_trades', []))}</li>
+<li>Trades ouverts: {len(detection.get('open_trades', []))}</li>
+<li>Trades fermés: {len(detection.get('closed_trades', []))}</li>
+<li>Snapshots order_ok non retrouvés dans MT5: {len(detection.get('unmatched_order_ok', []))}</li>
+<li>Positions fermées UNKNOWN dans snapshots: {len(detection.get('unknown_closed_snapshots', []))}</li>
+</ul>
+
 <h2>2) Analyse MT5</h2>
 <p class="muted">Lignes MT5 ignorées (vides/inexploitables): {mt5.get('ignored_rows', 0)}</p>
 <p class="muted">Format détecté: {mt5.get('source_format', 'unknown')} | Contrôle Résultats: Nb trades={report_stats.get('nb_trades', 'N/A')}, Profit Total Net={report_stats.get('profit_total_net', 'N/A')}</p>
@@ -1438,10 +1539,13 @@ def build_resume(
     counts = console.get("event_counts", {})
     report_stats = mt5.get("report_stats", {}) or {}
     day_status, day_conclusion = evaluate_day(m, counts)
+    detection = summarize_trade_detection(mt5, snaps)
 
     lines = [
         "=== RÉSUMÉ DÉBRIEF BTC (copier-coller ChatGPT) ===",
         f"Trades={m.get('total_trades', 0)} | Net={m.get('profit_net', 0.0):.2f} | TP/SL/BE={m.get('tp_count', 0)}/{m.get('sl_count', 0)}/{m.get('be_count', 0)}",
+        f"Détection bot/manuels: bot={len(detection.get('bot_trades', []))}, manuels={len(detection.get('manual_unknown_trades', []))}, ouverts={len(detection.get('open_trades', []))}, fermés={len(detection.get('closed_trades', []))}",
+        f"Fiabilité: MT5 lu={'OUI' if detection.get('mt5_read_ok') else 'NON'}, snapshots lus={'OUI' if detection.get('snapshots_read_ok') else 'NON'}, matching ticket={'OUI' if detection.get('matching_ticket') else 'NON'}",
         f"Jour: {day_status} | Conclusion: {day_conclusion}",
         f"Console: GPT_TIMEOUT={counts.get('GPT_TIMEOUT', 0)}, M5_TOO_FAR={counts.get('M5_TOO_FAR', 0)}, OUT_OF_SESSION={counts.get('OUT_OF_SESSION', 0)}, ALLOW={counts.get('ALLOW', 0)}, BLOCK={counts.get('BLOCK', 0)}",
         f"Contrôle rapport MT5: Nb trades={report_stats.get('nb_trades', 'N/A')}, Profit Total Net={report_stats.get('profit_total_net', 'N/A')} (sans remplacer le parsing Positions)",
