@@ -1282,9 +1282,16 @@ def build_html(
             matching_final_count += 1
         confidence_levels.append(ctx.get("association_confidence", "faible"))
 
-    mt5_total_trades = len(mt5.get("trades", []))
+    parsed_mt5_trades = len(mt5.get("trades", []))
+    report_nb_trades = report_stats.get("nb_trades")
+    report_nb_trades_int = int(report_nb_trades) if report_nb_trades is not None else None
+    mt5_total_trades = max(parsed_mt5_trades, report_nb_trades_int or 0)
+
     bot_retained_trades = len(detection.get("bot_trades", []))
-    manual_unknown_excluded = len(detection.get("manual_unknown_trades", []))
+    manual_unknown_excluded = max(
+        len(detection.get("manual_unknown_trades", [])),
+        mt5_total_trades - bot_retained_trades,
+    )
 
     confidence_map = {"haute": "bonne", "moyenne": "moyenne", "faible": "faible"}
     confidence_rank = {"bonne": 3, "moyenne": 2, "faible": 1}
@@ -1468,8 +1475,8 @@ th,td {{ border: 1px solid #ccc; padding: 6px; font-size: 13px; text-align: left
 <li>matching temporel + side + entry : {'OUI' if matching_context_count > 0 else 'NON'} ({matching_context_count}/{len(contexts)})</li>
 <li>matching final : {'OUI' if matching_final_count > 0 else 'NON'} ({matching_final_count}/{len(contexts)})</li>
 <li>confiance : {overall_confidence}</li>
-<li>trades manuels détectés : {len(detection.get('manual_unknown_trades', []))}</li>
-<li>trades bot détectés : {len(detection.get('bot_trades', []))}</li>
+<li>trades manuels détectés : {manual_unknown_excluded}</li>
+<li>trades bot détectés : {bot_retained_trades}</li>
 </ul>
 
 <h2>1ter) Distinction des trades</h2>
@@ -1477,7 +1484,7 @@ th,td {{ border: 1px solid #ccc; padding: 6px; font-size: 13px; text-align: left
 <li>Trades MT5 totaux: {mt5_total_trades}</li>
 <li>Trades bot retenus: {bot_retained_trades}</li>
 <li>Trades manuels / inconnus exclus: {manual_unknown_excluded}</li>
-<li>Trades manuels / inconnus: {len(detection.get('manual_unknown_trades', []))}</li>
+<li>Trades manuels / inconnus: {manual_unknown_excluded}</li>
 <li>Trades ouverts: {len(detection.get('open_trades', []))}</li>
 <li>Trades fermés: {len(detection.get('closed_trades', []))}</li>
 <li>Snapshots order_ok non retrouvés dans MT5: {len(detection.get('unmatched_order_ok', []))}</li>
