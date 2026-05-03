@@ -1269,6 +1269,30 @@ def build_html(
     day_status, day_conclusion = evaluate_day(metrics, counts)
     detection = summarize_trade_detection(mt5, snaps)
 
+    matching_context_count = 0
+    matching_final_count = 0
+    confidence_levels = []
+    for ctx in contexts:
+        trade = ctx.get("trade")
+        selected_snapshot = ctx["snapshots"][0] if ctx.get("snapshots") else None
+        reliable_status, _ = is_matching_reliable(trade, selected_snapshot, ctx.get("snapshot_debug", {}))
+        if ctx.get("entry_context_usable"):
+            matching_context_count += 1
+        if reliable_status in {"OUI", "MOYEN"}:
+            matching_final_count += 1
+        confidence_levels.append(ctx.get("association_confidence", "faible"))
+
+    mt5_total_trades = len(mt5.get("trades", []))
+    bot_retained_trades = len(detection.get("bot_trades", []))
+    manual_unknown_excluded = len(detection.get("manual_unknown_trades", []))
+
+    confidence_map = {"haute": "bonne", "moyenne": "moyenne", "faible": "faible"}
+    confidence_rank = {"bonne": 3, "moyenne": 2, "faible": 1}
+    overall_confidence = "faible"
+    if confidence_levels:
+        mapped = [confidence_map.get(level, "faible") for level in confidence_levels]
+        overall_confidence = min(mapped, key=lambda value: confidence_rank[value])
+
     def rel(path: Path) -> str:
         return str(path.relative_to(out_dir.parent)).replace("\\", "/")
 
@@ -1441,13 +1465,18 @@ th,td {{ border: 1px solid #ccc; padding: 6px; font-size: 13px; text-align: left
 <li>MT5 lu : {'OUI' if detection.get('mt5_read_ok') else 'NON'}</li>
 <li>snapshots lus : {'OUI' if detection.get('snapshots_read_ok') else 'NON'}</li>
 <li>matching ticket : {'OUI' if detection.get('matching_ticket') else 'NON'}</li>
+<li>matching temporel + side + entry : {'OUI' if matching_context_count > 0 else 'NON'} ({matching_context_count}/{len(contexts)})</li>
+<li>matching final : {'OUI' if matching_final_count > 0 else 'NON'} ({matching_final_count}/{len(contexts)})</li>
+<li>confiance : {overall_confidence}</li>
 <li>trades manuels détectés : {len(detection.get('manual_unknown_trades', []))}</li>
 <li>trades bot détectés : {len(detection.get('bot_trades', []))}</li>
 </ul>
 
 <h2>1ter) Distinction des trades</h2>
 <ul>
-<li>Trades bot détectés: {len(detection.get('bot_trades', []))}</li>
+<li>Trades MT5 totaux: {mt5_total_trades}</li>
+<li>Trades bot retenus: {bot_retained_trades}</li>
+<li>Trades manuels / inconnus exclus: {manual_unknown_excluded}</li>
 <li>Trades manuels / inconnus: {len(detection.get('manual_unknown_trades', []))}</li>
 <li>Trades ouverts: {len(detection.get('open_trades', []))}</li>
 <li>Trades fermés: {len(detection.get('closed_trades', []))}</li>
