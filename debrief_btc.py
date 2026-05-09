@@ -95,6 +95,12 @@ class ChartImage:
     timestamp: Optional[datetime]
 
 
+@dataclass(frozen=True)
+class TradeOutcome:
+    outcome_detected: str
+    reason: str
+
+
 def parse_datetime(value: Any) -> Optional[datetime]:
     if value is None:
         return None
@@ -578,7 +584,7 @@ def finalize_mt5_parse(
         net_results.append(t.profit + (t.commission or 0.0) + (t.swap or 0.0))
     positives = [p for p in profits if p > 0]
     negatives = [p for p in profits if p < 0]
-    zeros = [p for p in profits if p == 0]
+    outcomes = Counter(detect_trade_outcome(t).outcome_detected for t in trades)
 
     durations = []
     for t in trades:
@@ -597,9 +603,11 @@ def finalize_mt5_parse(
         "report_stats": report_stats,
         "metrics": {
             "total_trades": len(trades),
-            "tp_count": len(positives),
-            "sl_count": len(negatives),
-            "be_count": len(zeros),
+            "tp_count": outcomes.get("TP", 0),
+            "sl_count": outcomes.get("SL", 0),
+            "be_count": outcomes.get("BE", 0),
+            "sl_profit_count": outcomes.get("SL_PROFIT", 0),
+            "unknown_count": outcomes.get("UNKNOWN", 0),
             "profit_net": sum(net_results) if net_results else 0.0,
             "avg_gain": statistics.mean(positives) if positives else None,
             "avg_loss": statistics.mean(negatives) if negatives else None,
@@ -660,14 +668,45 @@ def extract_time_from_filename(filename: str) -> Optional[datetime]:
     return None
 
 
-def classify_trade_result(trade: Trade) -> str:
-    if trade.profit is None:
-        return "inconnu"
+def price_near(reference: Optional[float], actual: Optional[float], *, planned_distance: Optional[float] = None) -> bool:
+    if reference is None or actual is None:
+        return False
+    tolerance = 5.0
+    if planned_distance is not None and planned_distance > 0:
+        tolerance = max(tolerance, planned_distance * 0.05)
+    else:
+        tolerance = max(tolerance, abs(reference) * 0.0001)
+    return abs(actual - reference) <= tolerance
+
+
+def detect_trade_outcome(trade: Trade) -> TradeOutcome:
+    if trade.exit_price is None or trade.profit is None:
+        return TradeOutcome("UNKNOWN", "unknown")
+
+    planned_tp_distance = (
+        abs(trade.tp - trade.entry_price)
+        if trade.tp is not None and trade.entry_price is not None
+        else None
+    )
+    planned_sl_distance = (
+        abs(trade.sl - trade.entry_price)
+        if trade.sl is not None and trade.entry_price is not None
+        else None
+    )
+
+    if price_near(trade.tp, trade.exit_price, planned_distance=planned_tp_distance):
+        return TradeOutcome("TP", "close_near_tp")
+    if price_near(trade.entry_price, trade.exit_price, planned_distance=planned_tp_distance):
+        return TradeOutcome("BE", "close_near_entry")
+    if trade.profit <= 0 and price_near(trade.sl, trade.exit_price, planned_distance=planned_sl_distance):
+        return TradeOutcome("SL", "close_near_sl")
     if trade.profit > 0:
-        return "TP"
-    if trade.profit < 0:
-        return "SL"
-    return "BE"
+        return TradeOutcome("SL_PROFIT", "sl_moved_in_profit")
+    return TradeOutcome("UNKNOWN", "unknown")
+
+
+def classify_trade_result(trade: Trade) -> str:
+    return detect_trade_outcome(trade).outcome_detected
 
 
 
@@ -1335,6 +1374,7 @@ def build_html(
         before_line = snapshot_summary_line(best_before, trade_anchor, "Meilleur snapshot AVANT entrée")
         after_line = snapshot_summary_line(best_after, trade_anchor, "Meilleur snapshot APRÈS entrée")
         reliable_status, reliable_reason = is_matching_reliable(t, selected_snapshot, snap_debug)
+        outcome = detect_trade_outcome(t)
         context_exploitable = ctx.get("entry_context_usable", False) and reliable_status in {"OUI", "MOYEN"}
         real_gap = snap_debug.get("gap_minutes")
         gpt_decision = (
@@ -1392,7 +1432,9 @@ def build_html(
             f"<b>Heure normalisée (matching):</b> {fmt_dt(trade_anchor)} | "
             f"<b>Heure snapshot retenu:</b> {fmt_dt(selected_snapshot.get('_timestamp')) if selected_snapshot else 'Aucun'} | "
             f"<b>Écart réel après offset:</b> {f'{real_gap:.2f} min' if real_gap is not None else 'N/A'}</p>"
-            f"<p><b>Résultat:</b> {classify_trade_result(t)}</p>"
+            f"<p><b>Résultat:</b> {outcome.outcome_detected} | "
+            f"<b>outcome_detected=</b>{outcome.outcome_detected} | "
+            f"<b>reason=</b>{outcome.reason}</p>"
             f"<p><b>Snapshots associés:</b> {len(ctx['snapshots'])} | <b>Événements console:</b> {html.escape(evs)}</p>"
             f"<p><b>Méthode d'association:</b> {html.escape(ctx.get('association_method', 'N/A'))} | "
             f"<b>Confiance:</b> {html.escape(ctx.get('association_confidence', 'faible'))}</p>"
@@ -1462,7 +1504,7 @@ th,td {{ border: 1px solid #ccc; padding: 6px; font-size: 13px; text-align: left
 <li>Date génération: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC</li>
 <li>Nombre de trades: {metrics.get('total_trades', 0)}</li>
 <li>Résultat net: {metrics.get('profit_net', 0.0):.2f}</li>
-<li>TP / SL / BE: {metrics.get('tp_count', 0)} / {metrics.get('sl_count', 0)} / {metrics.get('be_count', 0)}</li>
+<li>TP / SL / BE / SL_PROFIT: {metrics.get('tp_count', 0)} / {metrics.get('sl_count', 0)} / {metrics.get('be_count', 0)} / {metrics.get('sl_profit_count', 0)}</li>
 <li>Journée: <b>{day_status}</b></li>
 <li>Conclusion rapide: {html.escape(day_conclusion)}</li>
 </ul>
@@ -1579,7 +1621,7 @@ def build_resume(
 
     lines = [
         "=== RÉSUMÉ DÉBRIEF BTC (copier-coller ChatGPT) ===",
-        f"Trades={m.get('total_trades', 0)} | Net={m.get('profit_net', 0.0):.2f} | TP/SL/BE={m.get('tp_count', 0)}/{m.get('sl_count', 0)}/{m.get('be_count', 0)}",
+        f"Trades={m.get('total_trades', 0)} | Net={m.get('profit_net', 0.0):.2f} | TP/SL/BE/SL_PROFIT={m.get('tp_count', 0)}/{m.get('sl_count', 0)}/{m.get('be_count', 0)}/{m.get('sl_profit_count', 0)}",
         f"Détection bot/manuels: bot={len(detection.get('bot_trades', []))}, manuels={len(detection.get('manual_unknown_trades', []))}, ouverts={len(detection.get('open_trades', []))}, fermés={len(detection.get('closed_trades', []))}",
         f"Fiabilité: MT5 lu={'OUI' if detection.get('mt5_read_ok') else 'NON'}, snapshots lus={'OUI' if detection.get('snapshots_read_ok') else 'NON'}, matching ticket={'OUI' if detection.get('matching_ticket') else 'NON'}",
         f"Jour: {day_status} | Conclusion: {day_conclusion}",
