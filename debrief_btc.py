@@ -213,9 +213,10 @@ def parse_console(path: Path) -> Dict[str, Any]:
     errors: List[str] = []
 
     close_detected_event_map = {
+        "SL_PROFIT": "CLOSE_DETECTED_SL_PROFIT",
         "TP": "CLOSE_DETECTED_TP",
-        "SL": "CLOSE_DETECTED_SL",
         "BE": "CLOSE_DETECTED_BE",
+        "SL": "CLOSE_DETECTED_SL",
     }
 
     for i, line in enumerate(lines, start=1):
@@ -228,9 +229,11 @@ def parse_console(path: Path) -> Dict[str, Any]:
 
         if "CLOSE_DETECTED" in line_upper:
             for token, close_event in close_detected_event_map.items():
-                if token in line_upper:
+                token_as_suffix = f"CLOSE_DETECTED_{token}"
+                if token_as_suffix in line_upper or re.search(rf"(?<![A-Z0-9_]){re.escape(token)}(?![A-Z0-9_])", line_upper):
                     event_counts[close_event] += 1
                     matches.append({"line": i, "timestamp": ts, "event": close_event, "raw": line})
+                    break
 
         if any(re.search(pat, line, flags=re.IGNORECASE) for pat in ERROR_PATTERNS):
             errors.append(f"L{i}: {line}")
@@ -1291,6 +1294,190 @@ def is_matching_reliable(trade: Trade, snapshot: Optional[Dict[str, Any]], diagn
     return "NON", ", ".join(reasons + ["conditions de matching fiable non atteintes"])
 
 
+
+def fmt_value(value: Any, decimals: int = 2) -> str:
+    if value is None:
+        return "N/A"
+    if isinstance(value, float):
+        return f"{value:.{decimals}f}"
+    return str(value)
+
+
+def trade_net_result(trade: Trade) -> Optional[float]:
+    if trade.profit is None:
+        return None
+    return trade.profit + (trade.commission or 0.0) + (trade.swap or 0.0)
+
+
+def classify_day_quality(metrics: Dict[str, Any]) -> str:
+    pnl = metrics.get("profit_net", 0.0) or 0.0
+    sl_count = metrics.get("sl_count", 0) or 0
+    tp_count = metrics.get("tp_count", 0) or 0
+    sl_profit_count = metrics.get("sl_profit_count", 0) or 0
+    if abs(pnl) < 0.01:
+        return "JOURNÉE_NEUTRE"
+    if pnl < 0:
+        return "JOURNÉE_ROUGE"
+    if sl_profit_count > 0 and tp_count == 0 and sl_count == 0:
+        return "JOURNÉE_PROTÉGÉE"
+    if pnl > 0 and sl_count == 0:
+        return "JOURNÉE_PROPRE_VERTE"
+    if pnl > 0 and sl_count > 0:
+        return "JOURNÉE_VERTE_AVEC_SL"
+    return "JOURNÉE_NEUTRE"
+
+
+def analyze_stop_after_gain(trades: List[Trade]) -> Dict[str, Any]:
+    real_profit = sum((trade_net_result(t) or 0.0) for t in trades)
+    outcomes = [detect_trade_outcome(t).outcome_detected for t in trades]
+    first_trade = trades[0] if trades else None
+
+    first_tp_idx = next((i for i, outcome in enumerate(outcomes) if outcome == "TP"), None)
+    first_winner_idx = next(
+        (
+            i
+            for i, (trade, outcome) in enumerate(zip(trades, outcomes))
+            if outcome in {"TP", "SL_PROFIT"} and (trade_net_result(trade) or 0.0) > 0
+        ),
+        None,
+    )
+
+    after_first_winner = trades[first_winner_idx + 1 :] if first_winner_idx is not None else []
+    after_first_winner_profit = sum((trade_net_result(t) or 0.0) for t in after_first_winner)
+    stop_after_tp_profit = (
+        sum((trade_net_result(t) or 0.0) for t in trades[: first_tp_idx + 1])
+        if first_tp_idx is not None
+        else None
+    )
+    stop_after_winner_profit = (
+        sum((trade_net_result(t) or 0.0) for t in trades[: first_winner_idx + 1])
+        if first_winner_idx is not None
+        else None
+    )
+    diff_vs_real = stop_after_tp_profit - real_profit if stop_after_tp_profit is not None else None
+
+    if first_tp_idx is None or len(trades) <= first_tp_idx + 1:
+        conclusion = "PAS_ASSEZ_DE_DONNÉES"
+    elif diff_vs_real is not None and diff_vs_real > 0.01:
+        conclusion = "STOP_APRES_TP_AURAIT_AIDÉ"
+    elif diff_vs_real is not None and diff_vs_real < -0.01:
+        conclusion = "STOP_APRES_TP_AURAIT_COÛTÉ"
+    else:
+        conclusion = "PAS_ASSEZ_DE_DONNÉES"
+
+    return {
+        "premier_trade_result": detect_trade_outcome(first_trade).outcome_detected if first_trade else "N/A",
+        "premier_trade_profit": trade_net_result(first_trade) if first_trade else None,
+        "trades_apres_premier_gain": len(after_first_winner),
+        "resultat_trades_apres_premier_gain": after_first_winner_profit,
+        "profit_si_stop_apres_premier_tp": stop_after_tp_profit,
+        "profit_si_stop_apres_premier_trade_gagnant": stop_after_winner_profit,
+        "difference_vs_reel": diff_vs_real,
+        "difference_stop_gagnant_vs_reel": stop_after_winner_profit - real_profit if stop_after_winner_profit is not None else None,
+        "conclusion": conclusion,
+    }
+
+
+def snapshot_field(snapshot: Optional[Dict[str, Any]], keys: Tuple[str, ...]) -> Any:
+    if not snapshot:
+        return None
+    for key in keys:
+        if key in snapshot and snapshot.get(key) not in (None, ""):
+            return snapshot.get(key)
+    return None
+
+
+def snapshot_bool(snapshot: Optional[Dict[str, Any]], keys: Tuple[str, ...]) -> Optional[bool]:
+    value = snapshot_field(snapshot, keys)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().upper()
+    if text in {"1", "TRUE", "YES", "OUI", "ALLOW", "OK"}:
+        return True
+    if text in {"0", "FALSE", "NO", "NON", "NONE", "N/A"}:
+        return False
+    return bool(text)
+
+
+def snapshot_float_field(snapshot: Optional[Dict[str, Any]], keys: Tuple[str, ...]) -> Optional[float]:
+    return safe_float(snapshot_field(snapshot, keys))
+
+
+def gpt_allows(decision: str, status: str) -> bool:
+    text = f"{decision} {status}".upper()
+    return "ALLOW" in text or "ORDER_OK" in text or "GPT_ALLOW" in text
+
+
+def compute_entry_quality(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    trade: Trade = ctx["trade"]
+    snapshot = ctx["snapshots"][0] if ctx.get("snapshots") else None
+    console_events = {e.get("event") for e in ctx.get("console_events", [])}
+
+    setup_type = snapshot_field(snapshot, ("setup_type", "setup", "pattern"))
+    route_name = snapshot_field(snapshot, ("route_name", "route", "strategy_route"))
+    decision = snapshot_value(snapshot, ("gpt_decision", "decision_gpt", "decision", "gpt")) if snapshot else "N/A"
+    status = snapshot_value(snapshot, ("status", "result", "event", "gpt_status")) if snapshot else "N/A"
+    distance_ema20 = snapshot_float_field(snapshot, ("distance_ema20_m5", "ema20_m5_distance", "dist_ema20_m5", "distance_m5_ema20"))
+    distance_ema50 = snapshot_float_field(snapshot, ("distance_ema50_m5", "ema50_m5_distance", "dist_ema50_m5", "distance_m5_ema50"))
+    atr5 = snapshot_float_field(snapshot, ("atr5", "atr_m5", "atr_5", "m5_atr"))
+    atr15 = snapshot_float_field(snapshot, ("atr15", "atr_m15", "atr_15", "m15_atr"))
+    market_dirty = snapshot_bool(snapshot, ("market_dirty", "dirty_market", "is_market_dirty"))
+    market_too_tight = snapshot_bool(snapshot, ("market_too_tight", "too_tight", "range_too_tight"))
+    too_extended = snapshot_bool(snapshot, ("too_extended", "market_too_extended", "after_big_move", "big_move"))
+    pullback_near_ema = snapshot_bool(snapshot, ("pullback_near_ema", "near_ema_pullback", "pullback_ema"))
+    ema_reject = snapshot_bool(snapshot, ("ema_reject", "reject_ema", "ema_rejection"))
+    bearish_resume = snapshot_bool(snapshot, ("bearish_resume", "resume_bearish"))
+    bullish_resume = snapshot_bool(snapshot, ("bullish_resume", "resume_bullish"))
+    same_side_reentry = snapshot_bool(snapshot, ("same_side_reentry", "same_side_reentry_detected"))
+
+    side = normalize_side(trade.side) if normalize_side(trade.side) != "N/A" else (snapshot_side(snapshot) if snapshot else "N/A")
+    coherent_resume = bullish_resume if side == "BUY" else bearish_resume if side == "SELL" else None
+    coherent_signal = any(value is True for value in (pullback_near_ema, ema_reject, coherent_resume))
+    ema_values = [v for v in (distance_ema20, distance_ema50) if v is not None]
+    elevated_ema_distance = any(abs(v) >= 150 for v in ema_values)
+    reentry_risk = same_side_reentry is True or "REENTRY_TOO_CLOSE" in console_events
+
+    if not snapshot:
+        verdict = "INCONNU"
+    elif too_extended is True or reentry_risk or elevated_ema_distance:
+        verdict = "RISQUÉ"
+    elif gpt_allows(decision, status) and market_dirty is not True and too_extended is not True and coherent_signal:
+        verdict = "PROPRE"
+    elif gpt_allows(decision, status):
+        verdict = "LIMITE"
+    else:
+        verdict = "INCONNU"
+
+    return {
+        "trade": trade,
+        "setup_type": setup_type,
+        "route_name": route_name,
+        "side": side,
+        "decision_gpt": decision,
+        "status_gpt": status,
+        "entry": (snapshot_price(snapshot, ("entry", "entry_price", "price", "open_price")) if snapshot else None) or trade.entry_price,
+        "sl": (snapshot_price(snapshot, ("sl", "stop_loss", "stoploss")) if snapshot else None) or trade.sl,
+        "tp": (snapshot_price(snapshot, ("tp", "take_profit", "takeprofit")) if snapshot else None) or trade.tp,
+        "distance_ema20_m5": distance_ema20,
+        "distance_ema50_m5": distance_ema50,
+        "atr5": atr5,
+        "atr15": atr15,
+        "market_dirty": market_dirty,
+        "market_too_tight": market_too_tight,
+        "too_extended": too_extended,
+        "pullback_near_ema": pullback_near_ema,
+        "ema_reject": ema_reject,
+        "bearish_resume": bearish_resume,
+        "bullish_resume": bullish_resume,
+        "verdict_entree": verdict,
+    }
+
+
+def report_confidence_label(overall_confidence: str) -> str:
+    return {"bonne": "BON", "moyenne": "MOYEN", "faible": "FAIBLE"}.get(overall_confidence, "FAIBLE")
+
 def build_html(
     base_dir: Path,
     out_dir: Path,
@@ -1305,7 +1492,15 @@ def build_html(
     metrics = mt5.get("metrics", {})
     counts = console.get("event_counts", {})
     report_stats = mt5.get("report_stats", {}) or {}
+    final_close_counts = {
+        "CLOSE_DETECTED_TP": metrics.get("tp_count", 0),
+        "CLOSE_DETECTED_SL": metrics.get("sl_count", 0),
+        "CLOSE_DETECTED_BE": metrics.get("be_count", 0),
+        "CLOSE_DETECTED_SL_PROFIT": metrics.get("sl_profit_count", 0),
+    }
     day_status, day_conclusion = evaluate_day(metrics, counts)
+    day_quality_verdict = classify_day_quality(metrics)
+    stop_gain = analyze_stop_after_gain(mt5.get("trades", []))
     detection = summarize_trade_detection(mt5, snaps)
 
     matching_context_count = 0
@@ -1483,6 +1678,52 @@ def build_html(
 
     anomalies_html = "".join(f"<li>{html.escape(a)}</li>" for a in anomalies) or "<li>Aucune anomalie détectée</li>"
 
+    entry_quality_rows = []
+    entry_quality_items = [compute_entry_quality(ctx) for ctx in contexts]
+    for item in entry_quality_items:
+        t = item["trade"]
+        entry_quality_rows.append(
+            "<tr>"
+            f"<td>{t.index}</td>"
+            f"<td>{html.escape(str(item['setup_type'] or 'N/A'))}</td>"
+            f"<td>{html.escape(str(item['route_name'] or 'N/A'))}</td>"
+            f"<td>{html.escape(str(item['side'] or 'N/A'))}</td>"
+            f"<td>{html.escape(str(item['decision_gpt']))}</td>"
+            f"<td>{html.escape(str(item['status_gpt']))}</td>"
+            f"<td>{fmt_value(item['entry'])}</td>"
+            f"<td>{fmt_value(item['sl'])}</td>"
+            f"<td>{fmt_value(item['tp'])}</td>"
+            f"<td>{fmt_value(item['distance_ema20_m5'])}</td>"
+            f"<td>{fmt_value(item['distance_ema50_m5'])}</td>"
+            f"<td>{fmt_value(item['atr5'])}</td>"
+            f"<td>{fmt_value(item['atr15'])}</td>"
+            f"<td>{fmt_value(item['market_dirty'])}</td>"
+            f"<td>{fmt_value(item['market_too_tight'])}</td>"
+            f"<td>{fmt_value(item['too_extended'])}</td>"
+            f"<td>{fmt_value(item['pullback_near_ema'])}</td>"
+            f"<td>{fmt_value(item['ema_reject'])}</td>"
+            f"<td>{fmt_value(item['bearish_resume'])} / {fmt_value(item['bullish_resume'])}</td>"
+            f"<td><b>{html.escape(item['verdict_entree'])}</b></td>"
+            "</tr>"
+        )
+
+    confidence_label = report_confidence_label(overall_confidence)
+    keep_items = [
+        "Distinction TP / SL / BE / SL_PROFIT",
+        "Matching existant temporel/side/entry",
+        "Lecture MT5 et snapshots en analyse seule",
+    ]
+    watch_items = [
+        "Résultat des trades après premier gain",
+        "Entrées LIMITE/RISQUÉ avec distance EMA élevée ou signaux incomplets",
+        "Écarts console CLOSE_DETECTED_* vs outcome final MT5",
+    ]
+    candidate_change = (
+        "Tester en observation la règle 1 vrai TP = stop journée"
+        if stop_gain["conclusion"] == "STOP_APRES_TP_AURAIT_AIDÉ"
+        else "Aucune modification immédiate; accumuler plusieurs journées comparables"
+    )
+
     html_content = f"""<!doctype html>
 <html lang="fr">
 <head>
@@ -1501,7 +1742,7 @@ th,td {{ border: 1px solid #ccc; padding: 6px; font-size: 13px; text-align: left
 <h1>Rapport journalier BTC</h1>
 <h2>1) Résumé de la journée</h2>
 <ul>
-<li>Date génération: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC</li>
+<li>Date génération: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC</li>
 <li>Nombre de trades: {metrics.get('total_trades', 0)}</li>
 <li>Résultat net: {metrics.get('profit_net', 0.0):.2f}</li>
 <li>TP / SL / BE / SL_PROFIT: {metrics.get('tp_count', 0)} / {metrics.get('sl_count', 0)} / {metrics.get('be_count', 0)} / {metrics.get('sl_profit_count', 0)}</li>
@@ -1509,7 +1750,35 @@ th,td {{ border: 1px solid #ccc; padding: 6px; font-size: 13px; text-align: left
 <li>Conclusion rapide: {html.escape(day_conclusion)}</li>
 </ul>
 
-<h2>1bis) Fiabilité du rapport</h2>
+<h2>1bis) Résumé qualité de journée</h2>
+<ul>
+<li>Nombre de trades: {metrics.get('total_trades', 0)}</li>
+<li>Résultat net: {metrics.get('profit_net', 0.0):.2f}</li>
+<li>TP: {metrics.get('tp_count', 0)}</li>
+<li>SL: {metrics.get('sl_count', 0)}</li>
+<li>BE: {metrics.get('be_count', 0)}</li>
+<li>SL_PROFIT: {metrics.get('sl_profit_count', 0)}</li>
+<li>Profit moyen par trade: {fmt_value((metrics.get('profit_net', 0.0) / metrics.get('total_trades', 1)) if metrics.get('total_trades', 0) else None)}</li>
+<li>Meilleure position: {fmt_value(metrics.get('best_trade'))}</li>
+<li>Pire position: {fmt_value(metrics.get('worst_trade'))}</li>
+<li>verdict_journée: <b>{day_quality_verdict}</b></li>
+</ul>
+
+<h2>1ter) Analyse stop après gain</h2>
+<ul>
+<li>premier_trade_result: {html.escape(str(stop_gain['premier_trade_result']))}</li>
+<li>premier_trade_profit: {fmt_value(stop_gain['premier_trade_profit'])}</li>
+<li>trades_après_premier_gain: {stop_gain['trades_apres_premier_gain']}</li>
+<li>résultat_des_trades_après_premier_gain: {fmt_value(stop_gain['resultat_trades_apres_premier_gain'])}</li>
+<li>profit_si_stop_après_premier_TP: {fmt_value(stop_gain['profit_si_stop_apres_premier_tp'])}</li>
+<li>profit_si_stop_après_premier_trade_gagnant: {fmt_value(stop_gain['profit_si_stop_apres_premier_trade_gagnant'])}</li>
+<li>différence_vs_réel: {fmt_value(stop_gain['difference_vs_reel'])}</li>
+<li>différence_stop_gagnant_vs_réel: {fmt_value(stop_gain['difference_stop_gagnant_vs_reel'])}</li>
+<li>conclusion automatique: <b>{html.escape(stop_gain['conclusion'])}</b></li>
+</ul>
+<p class="muted">Un trade gagnant inclut TP ou SL_PROFIT positif. Un vrai TP reste séparé de SL_PROFIT.</p>
+
+<h2>1quater) Fiabilité du rapport</h2>
 <ul>
 <li>MT5 lu : {'OUI' if detection.get('mt5_read_ok') else 'NON'}</li>
 <li>snapshots lus : {'OUI' if detection.get('snapshots_read_ok') else 'NON'}</li>
@@ -1521,7 +1790,7 @@ th,td {{ border: 1px solid #ccc; padding: 6px; font-size: 13px; text-align: left
 <li>trades bot détectés : {bot_retained_trades}</li>
 </ul>
 
-<h2>1ter) Distinction des trades</h2>
+<h2>1quinquies) Distinction des trades</h2>
 <ul>
 <li>Trades MT5 totaux: {mt5_total_trades}</li>
 <li>Trades bot retenus: {bot_retained_trades}</li>
@@ -1545,6 +1814,8 @@ th,td {{ border: 1px solid #ccc; padding: 6px; font-size: 13px; text-align: left
 <ul>
 {''.join(f'<li>{k}: {v}</li>' for k, v in sorted(counts.items())) or '<li>Aucun événement détecté</li>'}
 </ul>
+<p><b>Compteurs fermeture ajustés sur résultat final MT5:</b> {', '.join(f'{k}={v}' for k, v in final_close_counts.items())}</p>
+<p class="muted">Ces compteurs ajustés évitent de compter une mention console CLOSE_DETECTED_SL comme vraie perte lorsque l'outcome final MT5 est SL_PROFIT.</p>
 <p class="muted">Mentions techniques SL/TP ignorées pour éviter les faux compteurs.</p>
 <p>Erreurs importantes: {len(console.get('errors', []))}</p>
 
@@ -1563,25 +1834,33 @@ th,td {{ border: 1px solid #ccc; padding: 6px; font-size: 13px; text-align: left
 <li>Décisions GPT: {dict(snaps.get('gpt_decisions', {}))}</li>
 </ul>
 
-<h2>5) Analyse par trade</h2>
+<h2>5) Qualité d’entrée par trade</h2>
+<table>
+<tr><th>#</th><th>setup_type</th><th>route_name</th><th>side</th><th>décision GPT</th><th>status GPT</th><th>entry</th><th>sl</th><th>tp</th><th>distance EMA20 M5</th><th>distance EMA50 M5</th><th>atr5</th><th>atr15</th><th>market_dirty</th><th>market_too_tight</th><th>too_extended</th><th>pullback_near_ema</th><th>ema_reject</th><th>bearish_resume / bullish_resume</th><th>verdict entrée</th></tr>
+{''.join(entry_quality_rows) if entry_quality_rows else '<tr><td colspan="20">Aucun trade à analyser.</td></tr>'}
+</table>
+<p class="muted">PROPRE = GPT_ALLOW/ORDER_OK + pas too_extended + pas market_dirty + signal pullback/reject/resume cohérent. LIMITE = GPT_ALLOW avec signaux incomplets. RISQUÉ = gros mouvement, same_side_reentry ou distance EMA élevée. INCONNU = données absentes.</p>
+
+<h2>6) Analyse détaillée par trade</h2>
 {''.join(context_blocks) if context_blocks else '<p>Aucun trade à analyser.</p>'}
 
-<h2>6) Skips importants</h2>
+<h2>7) Skips importants</h2>
 <ul>{skip_items}</ul>
 <ul>{''.join(f'<li>{html.escape(item)}</li>' for item in skip_interpretation)}</ul>
 
-<h2>7) Anomalies</h2>
+<h2>8) Anomalies</h2>
 <ul>{anomalies_html}</ul>
 
-<h2>8) Aide à la décision</h2>
+<h2>9) Futures décisions</h2>
 <ul>
-<li><b>À changer maintenant:</b> {'rien à changer' if metrics.get('profit_net', 0) > 0 and len(anomalies) == 0 else 'vérifier filtres dominants et anomalies clés'}</li>
-<li><b>À observer encore:</b> qualité des entrées vs M5_TOO_FAR, timeouts GPT, contexte session.</li>
-<li><b>À ne pas toucher:</b> lot size, horaires de session, SL/TP, trade cap, logique qui semble fonctionner.</li>
+<li><b>À ne pas modifier:</b> {html.escape('; '.join(keep_items))}</li>
+<li><b>À surveiller:</b> {html.escape('; '.join(watch_items))}</li>
+<li><b>Modification candidate:</b> {html.escape(candidate_change)}</li>
+<li><b>Niveau de confiance du rapport:</b> {confidence_label} (matching final {matching_final_count}/{len(contexts)}, confiance brute {overall_confidence})</li>
 <li><b>Priorité numéro 1:</b> {html.escape('Corriger la logique GPT timeout : jamais d’ALLOW automatique sur timeout' if any('DANGER : GPT timeout fallback ALLOW détecté' in a for a in anomalies) else (anomalies[0] if anomalies else 'Confirmer la stabilité sur plusieurs journées avant tout changement.'))}</li>
 </ul>
 
-<h2>9) Questions pour ChatGPT</h2>
+<h2>10) Questions pour ChatGPT</h2>
 <ol>
 <li>La journée était-elle vraiment tradable ?</li>
 <li>Les trades pris étaient-ils propres ou trop tardifs ?</li>
@@ -1599,7 +1878,7 @@ th,td {{ border: 1px solid #ccc; padding: 6px; font-size: 13px; text-align: left
 <li>Qu’est-ce qu’il ne faut surtout pas modifier ?</li>
 <li>Une modification du bot est-elle vraiment justifiée après cette journée ?</li>
 </ol>
-<h2>10) Ce que le rapport peut conclure / ne peut pas conclure</h2>
+<h2>11) Ce que le rapport peut conclure / ne peut pas conclure</h2>
 <ul>
 <li><b>Peut conclure:</b> qualité du matching temporel (avec offset), cohérence side/entry avec snapshot, et niveau de fiabilité (OUI/MOYEN/NON).</li>
 <li><b>Peut conclure:</b> si le snapshot est exploitable pour orienter la revue (analyse graphique recommandée).</li>
