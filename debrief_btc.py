@@ -434,16 +434,7 @@ def parse_mt5_tabulated_report(text: str) -> Dict[str, Any]:
             )
         )
 
-    close_comment_by_ticket: Dict[str, str] = {}
-    for raw in lines[end_idx + 1 :]:
-        if not re.search(r"\[\s*(?:tp|sl)\b", raw, flags=re.IGNORECASE):
-            continue
-        for trade in trades:
-            if trade.ticket and trade.ticket in raw:
-                close_comment_by_ticket.setdefault(trade.ticket, raw.strip())
-    for trade in trades:
-        if trade.ticket and trade.ticket in close_comment_by_ticket:
-            trade.comment = f"{trade.comment} close_comment={close_comment_by_ticket[trade.ticket]}"
+    attach_tabulated_close_comments(trades, lines, end_idx + 1)
 
     report_stats = parse_mt5_results_section(lines)
     return finalize_mt5_parse(
@@ -702,6 +693,72 @@ def mt5_close_marker(comment: str) -> Optional[str]:
     if re.search(r"\[\s*sl\b", text):
         return "SL"
     return None
+
+
+
+def mt5_trade_profit(trade: Optional[Trade]) -> Optional[float]:
+    """Profit net tel qu'affiché dans la ligne MT5 du trade."""
+    if trade is None:
+        return None
+    return trade.profit
+
+
+def timediff_minutes(a: Optional[datetime], b: Optional[datetime]) -> Optional[float]:
+    if a is None or b is None:
+        return None
+    return abs((a - b).total_seconds()) / 60.0
+
+
+def tabulated_close_comment_for_trade(trade: Trade, candidate_rows: List[str]) -> Optional[str]:
+    if not candidate_rows:
+        return None
+
+    ticket = str(trade.ticket).strip() if trade.ticket else ""
+    best: Optional[Tuple[int, str]] = None
+    for raw in candidate_rows:
+        marker = mt5_close_marker(raw)
+        if marker is None:
+            continue
+
+        score = 0
+        if ticket and re.search(rf"(?<!\d){re.escape(ticket)}(?!\d)", raw):
+            score += 100
+
+        cols = [c.strip() for c in raw.split("\t") if c.strip()]
+        parsed_times = [dt for dt in (parse_datetime(c) for c in cols) if dt]
+        if any((gap := timediff_minutes(dt, trade.close_time)) is not None and gap <= 2.0 for dt in parsed_times):
+            score += 30
+        elif any((gap := timediff_minutes(dt, trade.close_time)) is not None and gap <= 10.0 for dt in parsed_times):
+            score += 10
+
+        if trade.symbol and any(trade.symbol.lower() == c.lower() for c in cols):
+            score += 10
+
+        numbers = [parse_fr_number(c) for c in cols]
+        if trade.exit_price is not None and any(n is not None and abs(n - trade.exit_price) <= 0.02 for n in numbers):
+            score += 20
+        if trade.profit is not None and any(n is not None and abs(n - trade.profit) <= 0.02 for n in numbers):
+            score += 20
+
+        if score <= 0:
+            continue
+        if best is None or score > best[0]:
+            best = (score, raw.strip())
+
+    return best[1] if best else None
+
+
+def attach_tabulated_close_comments(trades: List[Trade], lines: List[str], search_start_idx: int) -> None:
+    candidate_rows = [
+        raw.strip()
+        for raw in lines[search_start_idx:]
+        if re.search(r"\[\s*(?:tp|sl)\b", raw, flags=re.IGNORECASE)
+    ]
+    for trade in trades:
+        close_comment = tabulated_close_comment_for_trade(trade, candidate_rows)
+        if close_comment:
+            trade.comment = f"{trade.comment} close_comment={close_comment}"
+
 
 
 def heuristic_trade_outcome(trade: Trade) -> TradeOutcome:
@@ -1368,20 +1425,44 @@ def snapshot_outcome(snapshot: Optional[Dict[str, Any]]) -> str:
     return "N/A"
 
 
+def snapshot_exit_price_coherent(trade: Trade, snapshot: Optional[Dict[str, Any]], outcome: str) -> bool:
+    if not snapshot or trade.exit_price is None:
+        return False
+
+    snap_tp = snapshot_price(snapshot, ("tp", "take_profit", "takeprofit")) or trade.tp
+    snap_sl = snapshot_price(snapshot, ("sl", "stop_loss", "stoploss")) or trade.sl
+    snap_entry = snapshot_price(snapshot, ("entry", "entry_price", "price", "open_price")) or trade.entry_price
+
+    if outcome == "TP":
+        planned_distance = abs(snap_tp - snap_entry) if snap_tp is not None and snap_entry is not None else None
+        return price_near(snap_tp, trade.exit_price, planned_distance=planned_distance)
+    if outcome == "SL":
+        planned_distance = abs(snap_sl - snap_entry) if snap_sl is not None and snap_entry is not None else None
+        return price_near(snap_sl, trade.exit_price, planned_distance=planned_distance) and (trade.profit or 0.0) <= BE_PROFIT_EPSILON
+    if outcome == "BE":
+        return price_near(snap_entry, trade.exit_price)
+    if outcome == "SL_PROFIT":
+        return (trade.profit or 0.0) > BE_PROFIT_EPSILON
+    return False
+
+
 def classify_final_exit(trade: Trade, snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     snap_outcome = snapshot_outcome(snapshot)
     marker = mt5_close_marker(trade.comment)
     heuristic = heuristic_trade_outcome(trade)
     final = heuristic.outcome_detected
     reason = heuristic.reason
-    source = "HEURISTIC"
+    source = "HEURISTIC_UNCERTAIN"
+    confidence = "LOW"
 
     profit = trade.profit or 0.0
     if marker == "TP":
         final = "TP"
         source = "MT5_TP"
+        confidence = "HIGH"
         reason = "commentaire MT5 fermeture [tp ...] prioritaire"
     elif marker == "SL":
+        confidence = "HIGH"
         if profit < -BE_PROFIT_EPSILON:
             final = "SL"
             source = "MT5_SL"
@@ -1397,6 +1478,7 @@ def classify_final_exit(trade: Trade, snapshot: Optional[Dict[str, Any]] = None)
     elif snap_outcome in {"TP", "SL", "BE", "SL_PROFIT"}:
         final = snap_outcome
         source = "SNAPSHOT"
+        confidence = "MEDIUM" if snapshot_exit_price_coherent(trade, snapshot, snap_outcome) else "LOW"
         reason = "outcome snapshot utilisé faute de marqueur MT5 clair"
 
     conflict_notes = []
@@ -1406,6 +1488,8 @@ def classify_final_exit(trade: Trade, snapshot: Optional[Dict[str, Any]] = None)
         conflict_notes.append("Snapshot SL mais profit MT5 positif")
     if marker and heuristic.outcome_detected != final:
         conflict_notes.append(f"Heuristique ancienne={heuristic.outcome_detected}, corrigée par MT5")
+    if marker is None:
+        conflict_notes.append("close_reason_missing")
 
     return {
         "trade": trade,
@@ -1413,9 +1497,10 @@ def classify_final_exit(trade: Trade, snapshot: Optional[Dict[str, Any]] = None)
         "heuristic_outcome": heuristic.outcome_detected,
         "outcome_final": final,
         "decision_source": source,
+        "confidence_outcome": confidence,
         "reason": reason,
         "conflict_note": " | ".join(conflict_notes),
-        "has_conflict": bool(conflict_notes),
+        "has_conflict": bool([note for note in conflict_notes if note != "close_reason_missing"]),
     }
 
 
@@ -1463,7 +1548,9 @@ def classify_day_quality(metrics: Dict[str, Any]) -> str:
 
 
 def analyze_stop_after_gain(trades: List[Trade]) -> Dict[str, Any]:
-    real_profit = sum((trade_net_result(t) or 0.0) for t in trades)
+    # Les simulations de stop après gain doivent reprendre le profit MT5 affiché
+    # dans la ligne du trade, sans recalcul commission/swap additionnel.
+    real_profit = sum((mt5_trade_profit(t) or 0.0) for t in trades)
     outcomes = [detect_trade_outcome(t).outcome_detected for t in trades]
     first_trade = trades[0] if trades else None
 
@@ -1472,20 +1559,20 @@ def analyze_stop_after_gain(trades: List[Trade]) -> Dict[str, Any]:
         (
             i
             for i, (trade, outcome) in enumerate(zip(trades, outcomes))
-            if outcome in {"TP", "SL_PROFIT"} and (trade_net_result(trade) or 0.0) > 0
+            if outcome in {"TP", "SL_PROFIT"} and (mt5_trade_profit(trade) or 0.0) > 0
         ),
         None,
     )
 
     after_first_winner = trades[first_winner_idx + 1 :] if first_winner_idx is not None else []
-    after_first_winner_profit = sum((trade_net_result(t) or 0.0) for t in after_first_winner)
+    after_first_winner_profit = sum((mt5_trade_profit(t) or 0.0) for t in after_first_winner)
     stop_after_tp_profit = (
-        sum((trade_net_result(t) or 0.0) for t in trades[: first_tp_idx + 1])
+        sum((mt5_trade_profit(t) or 0.0) for t in trades[: first_tp_idx + 1])
         if first_tp_idx is not None
         else None
     )
     stop_after_winner_profit = (
-        sum((trade_net_result(t) or 0.0) for t in trades[: first_winner_idx + 1])
+        sum((mt5_trade_profit(t) or 0.0) for t in trades[: first_winner_idx + 1])
         if first_winner_idx is not None
         else None
     )
@@ -1502,7 +1589,7 @@ def analyze_stop_after_gain(trades: List[Trade]) -> Dict[str, Any]:
 
     return {
         "premier_trade_result": detect_trade_outcome(first_trade).outcome_detected if first_trade else "N/A",
-        "premier_trade_profit": trade_net_result(first_trade) if first_trade else None,
+        "premier_trade_profit": mt5_trade_profit(first_trade) if first_trade else None,
         "trades_apres_premier_gain": len(after_first_winner),
         "resultat_trades_apres_premier_gain": after_first_winner_profit,
         "profit_si_stop_apres_premier_tp": stop_after_tp_profit,
@@ -1893,7 +1980,8 @@ def build_html(
             f"<td>{html.escape(t.comment or '')}</td>"
             f"<td>{html.escape(item.get('snapshot_outcome', 'N/A'))}</td>"
             f"<td><b>{html.escape(item.get('outcome_final', 'UNKNOWN'))}</b></td>"
-            f"<td>{html.escape(item.get('decision_source', 'HEURISTIC'))}</td>"
+            f"<td>{html.escape(item.get('decision_source', 'HEURISTIC_UNCERTAIN'))}</td>"
+            f"<td>{html.escape(item.get('confidence_outcome', 'LOW'))}</td>"
             f"<td>{html.escape(note or item.get('reason', ''))}</td>"
             "</tr>"
         )
@@ -2040,8 +2128,8 @@ th,td {{ border: 1px solid #ccc; padding: 6px; font-size: 13px; text-align: left
 
 <h2>1sexies) Classification finale des sorties</h2>
 <table>
-<tr><th>ticket / position</th><th>side</th><th>entry</th><th>exit</th><th>profit</th><th>commentaire ordre fermeture MT5</th><th>outcome snapshot</th><th>outcome final</th><th>source décision</th><th>remarque</th></tr>
-{''.join(final_exit_rows) if final_exit_rows else '<tr><td colspan="10">Aucun trade à classifier.</td></tr>'}
+<tr><th>ticket / position</th><th>side</th><th>entry</th><th>exit</th><th>profit</th><th>commentaire ordre fermeture MT5</th><th>outcome snapshot</th><th>outcome final</th><th>source décision</th><th>confidence_outcome</th><th>remarque</th></tr>
+{''.join(final_exit_rows) if final_exit_rows else '<tr><td colspan="11">Aucun trade à classifier.</td></tr>'}
 </table>
 <p class="muted">Priorité: MT5 [tp ...] ou [sl ...] prévaut sur snapshot. Les compteurs globaux TP/SL/BE/SL_PROFIT utilisent l’outcome final retenu.</p>
 
