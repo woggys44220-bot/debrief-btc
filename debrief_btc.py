@@ -65,6 +65,8 @@ WEAK_CONFIDENCE_GAP_MINUTES = 15
 
 SNAPSHOT_ASSOCIATION_OFFSETS_HOURS = [0, 2, -2, 3, -3, 4, -4]
 WIDE_PRE_ENTRY_WINDOW_MINUTES = 120
+BE_PROFIT_EPSILON = 0.01
+
 
 
 @dataclass
@@ -432,6 +434,17 @@ def parse_mt5_tabulated_report(text: str) -> Dict[str, Any]:
             )
         )
 
+    close_comment_by_ticket: Dict[str, str] = {}
+    for raw in lines[end_idx + 1 :]:
+        if not re.search(r"\[\s*(?:tp|sl)\b", raw, flags=re.IGNORECASE):
+            continue
+        for trade in trades:
+            if trade.ticket and trade.ticket in raw:
+                close_comment_by_ticket.setdefault(trade.ticket, raw.strip())
+    for trade in trades:
+        if trade.ticket and trade.ticket in close_comment_by_ticket:
+            trade.comment = f"{trade.comment} close_comment={close_comment_by_ticket[trade.ticket]}"
+
     report_stats = parse_mt5_results_section(lines)
     return finalize_mt5_parse(
         trades=trades,
@@ -504,7 +517,7 @@ def parse_mt5_simple_csv(path: Path) -> Dict[str, Any]:
             col_deal = detect_column(headers, ["deal", "dealid", "transactionid", "iddeal"])
             col_sl = detect_column(headers, ["sl", "stoploss", "stop_loss"])
             col_tp = detect_column(headers, ["tp", "takeprofit", "take_profit"])
-            col_comment = detect_column(headers, ["comment", "commentaire", "note"])
+            col_comment = detect_column(headers, ["comment", "commentaire", "note", "closecomment", "commentclose", "closingcomment", "commentairefermeture"])
 
             for idx, row in enumerate(reader, start=1):
                 row_values = [str(v).strip() for v in row.values() if v is not None]
@@ -682,7 +695,16 @@ def price_near(reference: Optional[float], actual: Optional[float], *, planned_d
     return abs(actual - reference) <= tolerance
 
 
-def detect_trade_outcome(trade: Trade) -> TradeOutcome:
+def mt5_close_marker(comment: str) -> Optional[str]:
+    text = (comment or "").lower()
+    if re.search(r"\[\s*tp\b", text):
+        return "TP"
+    if re.search(r"\[\s*sl\b", text):
+        return "SL"
+    return None
+
+
+def heuristic_trade_outcome(trade: Trade) -> TradeOutcome:
     if trade.exit_price is None or trade.profit is None:
         return TradeOutcome("UNKNOWN", "unknown")
 
@@ -706,6 +728,20 @@ def detect_trade_outcome(trade: Trade) -> TradeOutcome:
     if trade.profit > 0:
         return TradeOutcome("SL_PROFIT", "sl_moved_in_profit")
     return TradeOutcome("UNKNOWN", "unknown")
+
+
+def detect_trade_outcome(trade: Trade) -> TradeOutcome:
+    marker = mt5_close_marker(trade.comment)
+    profit = trade.profit or 0.0
+    if marker == "TP":
+        return TradeOutcome("TP", "mt5_close_comment_tp")
+    if marker == "SL":
+        if profit < -BE_PROFIT_EPSILON:
+            return TradeOutcome("SL", "mt5_close_comment_sl_negative")
+        if profit > BE_PROFIT_EPSILON:
+            return TradeOutcome("SL_PROFIT", "mt5_close_comment_sl_positive")
+        return TradeOutcome("BE", "mt5_close_comment_sl_near_zero")
+    return heuristic_trade_outcome(trade)
 
 
 def classify_trade_result(trade: Trade) -> str:
@@ -1309,6 +1345,105 @@ def trade_net_result(trade: Trade) -> Optional[float]:
     return trade.profit + (trade.commission or 0.0) + (trade.swap or 0.0)
 
 
+def snapshot_outcome(snapshot: Optional[Dict[str, Any]]) -> str:
+    if not snapshot:
+        return "N/A"
+    keys = (
+        "outcome", "outcome_detected", "resultat", "close_result", "close_reason",
+        "detected_outcome", "final_outcome", "status",
+    )
+    for key in keys:
+        value = snapshot.get(key)
+        if value in (None, ""):
+            continue
+        text = str(value).upper()
+        if "SL_PROFIT" in text or "SL PROFIT" in text:
+            return "SL_PROFIT"
+        if re.search(r"(?<![A-Z0-9_])TP(?![A-Z0-9_])", text):
+            return "TP"
+        if re.search(r"(?<![A-Z0-9_])BE(?![A-Z0-9_])", text) or "BREAK_EVEN" in text:
+            return "BE"
+        if re.search(r"(?<![A-Z0-9_])SL(?![A-Z0-9_])", text):
+            return "SL"
+    return "N/A"
+
+
+def classify_final_exit(trade: Trade, snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    snap_outcome = snapshot_outcome(snapshot)
+    marker = mt5_close_marker(trade.comment)
+    heuristic = heuristic_trade_outcome(trade)
+    final = heuristic.outcome_detected
+    reason = heuristic.reason
+    source = "HEURISTIC"
+
+    profit = trade.profit or 0.0
+    if marker == "TP":
+        final = "TP"
+        source = "MT5_TP"
+        reason = "commentaire MT5 fermeture [tp ...] prioritaire"
+    elif marker == "SL":
+        if profit < -BE_PROFIT_EPSILON:
+            final = "SL"
+            source = "MT5_SL"
+            reason = "commentaire MT5 fermeture [sl ...] + profit négatif"
+        elif profit > BE_PROFIT_EPSILON:
+            final = "SL_PROFIT"
+            source = "MT5_SL_PROFIT"
+            reason = "commentaire MT5 fermeture [sl ...] + profit positif"
+        else:
+            final = "BE"
+            source = "MT5_SL"
+            reason = "commentaire MT5 fermeture [sl ...] + profit proche de zéro"
+    elif snap_outcome in {"TP", "SL", "BE", "SL_PROFIT"}:
+        final = snap_outcome
+        source = "SNAPSHOT"
+        reason = "outcome snapshot utilisé faute de marqueur MT5 clair"
+
+    conflict_notes = []
+    if marker and snap_outcome in {"TP", "SL", "BE", "SL_PROFIT"} and snap_outcome != final:
+        conflict_notes.append(f"Conflit snapshot={snap_outcome} vs MT5={marker}; MT5 prioritaire")
+    if snap_outcome == "SL" and trade.profit is not None and trade.profit > BE_PROFIT_EPSILON:
+        conflict_notes.append("Snapshot SL mais profit MT5 positif")
+    if marker and heuristic.outcome_detected != final:
+        conflict_notes.append(f"Heuristique ancienne={heuristic.outcome_detected}, corrigée par MT5")
+
+    return {
+        "trade": trade,
+        "snapshot_outcome": snap_outcome,
+        "heuristic_outcome": heuristic.outcome_detected,
+        "outcome_final": final,
+        "decision_source": source,
+        "reason": reason,
+        "conflict_note": " | ".join(conflict_notes),
+        "has_conflict": bool(conflict_notes),
+    }
+
+
+def final_exit_classifications(contexts: List[Dict[str, Any]], trades: List[Trade]) -> List[Dict[str, Any]]:
+    by_index = {ctx["trade"].index: ctx for ctx in contexts if ctx.get("trade")}
+    rows = []
+    for trade in trades:
+        ctx = by_index.get(trade.index, {})
+        snapshot = ctx.get("snapshots", [None])[0] if ctx.get("snapshots") else None
+        item = classify_final_exit(trade, snapshot)
+        item["entry_context_usable"] = bool(ctx.get("entry_context_usable"))
+        item["selected_snapshot"] = snapshot
+        item["context"] = ctx
+        rows.append(item)
+    return rows
+
+
+def apply_final_outcome_metrics(mt5: Dict[str, Any], classifications: List[Dict[str, Any]]) -> None:
+    metrics = mt5.setdefault("metrics", {})
+    outcomes = Counter(item["outcome_final"] for item in classifications)
+    metrics["tp_count"] = outcomes.get("TP", 0)
+    metrics["sl_count"] = outcomes.get("SL", 0)
+    metrics["be_count"] = outcomes.get("BE", 0)
+    metrics["sl_profit_count"] = outcomes.get("SL_PROFIT", 0)
+    metrics["unknown_count"] = outcomes.get("UNKNOWN", 0)
+    mt5["final_exit_classifications"] = classifications
+
+
 def classify_day_quality(metrics: Dict[str, Any]) -> str:
     pnl = metrics.get("profit_net", 0.0) or 0.0
     sl_count = metrics.get("sl_count", 0) or 0
@@ -1359,9 +1494,9 @@ def analyze_stop_after_gain(trades: List[Trade]) -> Dict[str, Any]:
     if first_tp_idx is None or len(trades) <= first_tp_idx + 1:
         conclusion = "PAS_ASSEZ_DE_DONNÉES"
     elif diff_vs_real is not None and diff_vs_real > 0.01:
-        conclusion = "STOP_APRES_TP_AURAIT_AIDÉ"
+        conclusion = "UTILE"
     elif diff_vs_real is not None and diff_vs_real < -0.01:
-        conclusion = "STOP_APRES_TP_AURAIT_COÛTÉ"
+        conclusion = "PAS_UTILE"
     else:
         conclusion = "PAS_ASSEZ_DE_DONNÉES"
 
@@ -1438,9 +1573,27 @@ def compute_entry_quality(ctx: Dict[str, Any]) -> Dict[str, Any]:
     ema_values = [v for v in (distance_ema20, distance_ema50) if v is not None]
     elevated_ema_distance = any(abs(v) >= 150 for v in ema_values)
     reentry_risk = same_side_reentry is True or "REENTRY_TOO_CLOSE" in console_events
+    filters_present = any(
+        value is not None
+        for value in (market_dirty, market_too_tight, too_extended, pullback_near_ema, ema_reject, bearish_resume, bullish_resume)
+    )
+    full_snapshot_context = bool(snapshot and setup_type and route_name and decision != "N/A" and filters_present and has_full_setup(snapshot))
+    partial_snapshot_context = bool(snapshot and not full_snapshot_context)
+    relaxed_setup = any(
+        bool(snapshot_field(snapshot, keys))
+        for keys in (
+            ("relaxed", "setup_relaxed", "is_relaxed"),
+            ("near_miss", "is_near_miss"),
+            ("would_block_if_strict", "blocked_if_strict"),
+        )
+    )
+    breakout_not_confirmed = snapshot_bool(snapshot, ("breakout_confirm_ok", "breakout_confirmed")) is False
+    minimum_limite = relaxed_setup or breakout_not_confirmed
 
     if not snapshot:
-        verdict = "INCONNU"
+        verdict = "INCONNU_SNAPSHOT_MANQUANT"
+    elif partial_snapshot_context:
+        verdict = "PARTIEL"
     elif too_extended is True or reentry_risk or elevated_ema_distance:
         verdict = "RISQUÉ"
     elif gpt_allows(decision, status) and market_dirty is not True and too_extended is not True and coherent_signal:
@@ -1448,7 +1601,9 @@ def compute_entry_quality(ctx: Dict[str, Any]) -> Dict[str, Any]:
     elif gpt_allows(decision, status):
         verdict = "LIMITE"
     else:
-        verdict = "INCONNU"
+        verdict = "MAUVAIS"
+    if minimum_limite and verdict == "PROPRE":
+        verdict = "LIMITE"
 
     return {
         "trade": trade,
@@ -1471,6 +1626,7 @@ def compute_entry_quality(ctx: Dict[str, Any]) -> Dict[str, Any]:
         "ema_reject": ema_reject,
         "bearish_resume": bearish_resume,
         "bullish_resume": bullish_resume,
+        "snapshot_context_level": "COMPLET" if full_snapshot_context else "PARTIEL" if partial_snapshot_context else "ABSENT",
         "verdict_entree": verdict,
     }
 
@@ -1707,6 +1863,87 @@ def build_html(
             "</tr>"
         )
 
+    final_classifications = mt5.get("final_exit_classifications") or final_exit_classifications(contexts, mt5.get("trades", []))
+    final_exit_rows = []
+    conflict_rows = []
+    missing_entry_rows = []
+    conflicts_count = 0
+    for item in final_classifications:
+        t = item["trade"]
+        note = item.get("conflict_note") or ""
+        if item.get("has_conflict"):
+            conflicts_count += 1
+            conflict_rows.append(
+                "<tr>"
+                f"<td>{html.escape(str(t.ticket or t.index))}</td>"
+                f"<td>{html.escape(item.get('snapshot_outcome', 'N/A'))}</td>"
+                f"<td>{html.escape(t.comment or '')}</td>"
+                f"<td>{fmt_value(t.profit)}</td>"
+                f"<td><b>{html.escape(item.get('outcome_final', 'UNKNOWN'))}</b></td>"
+                f"<td>{html.escape(note)}</td>"
+                "</tr>"
+            )
+        final_exit_rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(t.ticket or t.order or t.deal or t.index))}</td>"
+            f"<td>{html.escape(t.side)}</td>"
+            f"<td>{fmt_value(t.entry_price)}</td>"
+            f"<td>{fmt_value(t.exit_price)}</td>"
+            f"<td>{fmt_value(t.profit)}</td>"
+            f"<td>{html.escape(t.comment or '')}</td>"
+            f"<td>{html.escape(item.get('snapshot_outcome', 'N/A'))}</td>"
+            f"<td><b>{html.escape(item.get('outcome_final', 'UNKNOWN'))}</b></td>"
+            f"<td>{html.escape(item.get('decision_source', 'HEURISTIC'))}</td>"
+            f"<td>{html.escape(note or item.get('reason', ''))}</td>"
+            "</tr>"
+        )
+        if not item.get("entry_context_usable"):
+            missing_entry_rows.append(
+                "<tr>"
+                f"<td>{html.escape(str(t.ticket or t.index))}</td>"
+                f"<td>{html.escape(t.side)}</td>"
+                f"<td>{fmt_value(t.entry_price)}</td>"
+                f"<td>{fmt_value(t.sl)}</td>"
+                f"<td>{fmt_value(t.tp)}</td>"
+                f"<td>{fmt_dt(t.open_time)}</td>"
+                f"<td>{fmt_dt(t.close_time)}</td>"
+                f"<td>{fmt_value(t.profit)}</td>"
+                "<td>SNAPSHOT_ENTRY_MISSING</td>"
+                "<td>Probablement trade déjà ouvert avant le début des snapshots, redémarrage bot, snapshots supprimés ou décalage temporel.</td>"
+                "</tr>"
+            )
+
+    complete_snapshot_count = sum(1 for item in entry_quality_items if item.get("snapshot_context_level") == "COMPLET")
+    missing_snapshot_count = len(missing_entry_rows)
+    winning_setups = Counter(
+        str(item.get("setup_type") or "N/A")
+        for item in entry_quality_items
+        if (trade_net_result(item["trade"]) or 0.0) > 0
+    )
+    losing_setups = Counter(
+        str(item.get("setup_type") or "N/A")
+        for item in entry_quality_items
+        if (trade_net_result(item["trade"]) or 0.0) < 0
+    )
+    best_trade_obj = max(mt5.get("trades", []), key=lambda t: t.profit if t.profit is not None else -1e18, default=None)
+    worst_trade_obj = min(mt5.get("trades", []), key=lambda t: t.profit if t.profit is not None else 1e18, default=None)
+    report_date = fmt_dt(metrics.get("first_trade")).split(" ")[0] if metrics.get("first_trade") else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    decision_summary = "\n".join([
+        f"date: {report_date}",
+        f"nb_trades: {metrics.get('total_trades', 0)}",
+        f"pnl_net: {metrics.get('profit_net', 0.0):.2f}",
+        f"TP/SL/BE/SL_PROFIT_corrigés: {metrics.get('tp_count', 0)}/{metrics.get('sl_count', 0)}/{metrics.get('be_count', 0)}/{metrics.get('sl_profit_count', 0)}",
+        f"meilleur_trade: #{best_trade_obj.index if best_trade_obj else 'N/A'} profit={fmt_value(best_trade_obj.profit if best_trade_obj else None)}",
+        f"pire_trade: #{worst_trade_obj.index if worst_trade_obj else 'N/A'} profit={fmt_value(worst_trade_obj.profit if worst_trade_obj else None)}",
+        f"trades_snapshot_complet: {complete_snapshot_count}",
+        f"trades_sans_snapshot_entree: {missing_snapshot_count}",
+        f"conflits_MT5_snapshot: {conflicts_count}",
+        f"setups_gagnants: {dict(winning_setups)}",
+        f"setups_perdants: {dict(losing_setups)}",
+        f"conclusion_automatique: {day_quality_verdict} - {day_conclusion}",
+        "points_analyse_manuelle: " + ("conflits MT5/snapshot; trades sans snapshot entrée" if conflicts_count or missing_snapshot_count else "valider graphiquement les entrées LIMITE/RISQUÉ"),
+    ])
+
     confidence_label = report_confidence_label(overall_confidence)
     keep_items = [
         "Distinction TP / SL / BE / SL_PROFIT",
@@ -1720,7 +1957,7 @@ def build_html(
     ]
     candidate_change = (
         "Tester en observation la règle 1 vrai TP = stop journée"
-        if stop_gain["conclusion"] == "STOP_APRES_TP_AURAIT_AIDÉ"
+        if stop_gain["conclusion"] == "UTILE"
         else "Aucune modification immédiate; accumuler plusieurs journées comparables"
     )
 
@@ -1764,19 +2001,18 @@ th,td {{ border: 1px solid #ccc; padding: 6px; font-size: 13px; text-align: left
 <li>verdict_journée: <b>{day_quality_verdict}</b></li>
 </ul>
 
-<h2>1ter) Analyse stop après gain</h2>
+<h2>1ter) Utilité du stop après gain</h2>
 <ul>
-<li>premier_trade_result: {html.escape(str(stop_gain['premier_trade_result']))}</li>
-<li>premier_trade_profit: {fmt_value(stop_gain['premier_trade_profit'])}</li>
-<li>trades_après_premier_gain: {stop_gain['trades_apres_premier_gain']}</li>
-<li>résultat_des_trades_après_premier_gain: {fmt_value(stop_gain['resultat_trades_apres_premier_gain'])}</li>
-<li>profit_si_stop_après_premier_TP: {fmt_value(stop_gain['profit_si_stop_apres_premier_tp'])}</li>
-<li>profit_si_stop_après_premier_trade_gagnant: {fmt_value(stop_gain['profit_si_stop_apres_premier_trade_gagnant'])}</li>
-<li>différence_vs_réel: {fmt_value(stop_gain['difference_vs_reel'])}</li>
-<li>différence_stop_gagnant_vs_réel: {fmt_value(stop_gain['difference_stop_gagnant_vs_reel'])}</li>
-<li>conclusion automatique: <b>{html.escape(stop_gain['conclusion'])}</b></li>
+<li>Résultat réel: {fmt_value(metrics.get('profit_net', 0.0))}</li>
+<li>Résultat simulé stop après premier vrai TP: {fmt_value(stop_gain['profit_si_stop_apres_premier_tp'])}</li>
+<li>Résultat simulé stop après premier trade gagnant (TP ou SL_PROFIT): {fmt_value(stop_gain['profit_si_stop_apres_premier_trade_gagnant'])}</li>
+<li>Différence stop après premier TP vs réel: {fmt_value(stop_gain['difference_vs_reel'])}</li>
+<li>Différence stop après premier gagnant vs réel: {fmt_value(stop_gain['difference_stop_gagnant_vs_reel'])}</li>
+<li>Premier trade result: {html.escape(str(stop_gain['premier_trade_result']))} | profit={fmt_value(stop_gain['premier_trade_profit'])}</li>
+<li>Trades après premier gain: {stop_gain['trades_apres_premier_gain']} | résultat={fmt_value(stop_gain['resultat_trades_apres_premier_gain'])}</li>
+<li>Conclusion: <b>{html.escape(stop_gain['conclusion'])}</b></li>
 </ul>
-<p class="muted">Un trade gagnant inclut TP ou SL_PROFIT positif. Un vrai TP reste séparé de SL_PROFIT.</p>
+<p class="muted">Séparation explicite: stop après premier vrai TP, stop après premier trade gagnant au sens large, et comparaison au résultat réel.</p>
 
 <h2>1quater) Fiabilité du rapport</h2>
 <ul>
@@ -1801,6 +2037,28 @@ th,td {{ border: 1px solid #ccc; padding: 6px; font-size: 13px; text-align: left
 <li>Snapshots order_ok non retrouvés dans MT5: {len(detection.get('unmatched_order_ok', []))}</li>
 <li>Positions fermées UNKNOWN dans snapshots: {len(detection.get('unknown_closed_snapshots', []))}</li>
 </ul>
+
+<h2>1sexies) Classification finale des sorties</h2>
+<table>
+<tr><th>ticket / position</th><th>side</th><th>entry</th><th>exit</th><th>profit</th><th>commentaire ordre fermeture MT5</th><th>outcome snapshot</th><th>outcome final</th><th>source décision</th><th>remarque</th></tr>
+{''.join(final_exit_rows) if final_exit_rows else '<tr><td colspan="10">Aucun trade à classifier.</td></tr>'}
+</table>
+<p class="muted">Priorité: MT5 [tp ...] ou [sl ...] prévaut sur snapshot. Les compteurs globaux TP/SL/BE/SL_PROFIT utilisent l’outcome final retenu.</p>
+
+<h2>1septies) Trades sans contexte d’entrée exploitable</h2>
+<table>
+<tr><th>ticket</th><th>side</th><th>entry</th><th>SL</th><th>TP</th><th>open_time</th><th>close_time</th><th>profit</th><th>raison</th><th>conseil</th></tr>
+{''.join(missing_entry_rows) if missing_entry_rows else '<tr><td colspan="10">Aucun trade sans contexte d’entrée exploitable.</td></tr>'}
+</table>
+
+<h2>1octies) Conflits détectés</h2>
+<table>
+<tr><th>ticket</th><th>snapshot_outcome</th><th>mt5_close_comment</th><th>mt5_profit</th><th>outcome_final</th><th>résolution choisie</th></tr>
+{''.join(conflict_rows) if conflict_rows else '<tr><td colspan="6">Aucun conflit MT5/snapshot détecté.</td></tr>'}
+</table>
+
+<h2>1nonies) Résumé décisionnel pour ChatGPT</h2>
+<pre>{html.escape(decision_summary)}</pre>
 
 <h2>2) Analyse MT5</h2>
 <p class="muted">Lignes MT5 ignorées (vides/inexploitables): {mt5.get('ignored_rows', 0)}</p>
@@ -1839,7 +2097,7 @@ th,td {{ border: 1px solid #ccc; padding: 6px; font-size: 13px; text-align: left
 <tr><th>#</th><th>setup_type</th><th>route_name</th><th>side</th><th>décision GPT</th><th>status GPT</th><th>entry</th><th>sl</th><th>tp</th><th>distance EMA20 M5</th><th>distance EMA50 M5</th><th>atr5</th><th>atr15</th><th>market_dirty</th><th>market_too_tight</th><th>too_extended</th><th>pullback_near_ema</th><th>ema_reject</th><th>bearish_resume / bullish_resume</th><th>verdict entrée</th></tr>
 {''.join(entry_quality_rows) if entry_quality_rows else '<tr><td colspan="20">Aucun trade à analyser.</td></tr>'}
 </table>
-<p class="muted">PROPRE = GPT_ALLOW/ORDER_OK + pas too_extended + pas market_dirty + signal pullback/reject/resume cohérent. LIMITE = GPT_ALLOW avec signaux incomplets. RISQUÉ = gros mouvement, same_side_reentry ou distance EMA élevée. INCONNU = données absentes.</p>
+<p class="muted">PROPRE = snapshot complet + GPT_ALLOW/ORDER_OK + signaux cohérents. PARTIEL = snapshot présent mais incomplet. INCONNU_SNAPSHOT_MANQUANT = aucun snapshot proche. Un setup relaxé / near miss / breakout non confirmé / would_block_if_strict force au minimum LIMITE, jamais PROPRE.</p>
 
 <h2>6) Analyse détaillée par trade</h2>
 {''.join(context_blocks) if context_blocks else '<p>Aucun trade à analyser.</p>'}
@@ -1937,6 +2195,7 @@ def main() -> int:
     charts = parse_charts(base_dir / "charts")
 
     contexts, association_meta = associate_trade_context(mt5, console, snaps, charts)
+    apply_final_outcome_metrics(mt5, final_exit_classifications(contexts, mt5.get("trades", [])))
     anomalies = detect_anomalies(console, snaps, mt5, contexts)
 
     for src in (console, snaps, mt5, charts):
