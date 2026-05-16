@@ -68,6 +68,29 @@ class DailyReportQualityTest(unittest.TestCase):
         self.assertEqual(analysis["profit_si_stop_apres_premier_trade_gagnant"], 2.86)
         self.assertEqual(analysis["conclusion"], "PAS_ASSEZ_DE_DONNÉES")
 
+    def test_stop_after_gain_uses_mt5_profit_column_not_recomputed_net(self):
+        trade = Trade(
+            index=1,
+            open_time=None,
+            close_time=None,
+            symbol="BTCUSD",
+            side="BUY",
+            lot=0.05,
+            entry_price=81380.93,
+            exit_price=80971.61,
+            profit=-20.47,
+            commission=-3.39,
+            swap=None,
+            comment="",
+            sl=80971.61,
+            tp=82000.00,
+        )
+
+        analysis = analyze_stop_after_gain([trade])
+
+        self.assertEqual(analysis["premier_trade_profit"], -20.47)
+
+
     def test_console_does_not_count_sl_profit_as_sl(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "console.txt"
